@@ -13,14 +13,39 @@ Ein moderner, mausfreundlicher Dateimanager mit eingebautem Terminal für die WS
 
 ## Installation
 
-In der WSL:
+Voraussetzungen: WSL mit Ubuntu/Debian, `git` und Python 3 mit `venv`.
+Falls nötig, vorher einmal installieren:
 
 ```bash
-bash /mnt/c/Users/Lucas/Documents/SOURCE/WSLUI/install.sh --autostart
+sudo apt update && sudo apt install -y git python3-venv
 ```
 
+Dann in der WSL (nicht in PowerShell):
+
+```bash
+git clone https://github.com/lcsl90/WUI.git ~/wslui-src
+bash ~/wslui-src/install.sh --autostart
+```
+
+Der Installer legt eine eigene Python-Umgebung unter `~/.local/share/wslui` an und
+installiert dort `textual` und `pyte` – am System-Python wird nichts verändert.
+
 Optionen: `--autostart`, `--no-autostart`, `--uninstall`.
+Ohne Option fragt der Installer beim ersten Mal, ob WSLUI beim Öffnen von WSL automatisch
+starten soll; bei späteren Updates bleibt die bisherige Einstellung erhalten.
 Danach ein neues WSL-Fenster öffnen (oder `source ~/.bashrc`) und `wui` eingeben.
+
+### Aktualisieren
+
+```bash
+git -C ~/wslui-src pull && bash ~/wslui-src/install.sh
+```
+
+### Deinstallieren
+
+```bash
+bash ~/wslui-src/install.sh --uninstall
+```
 
 Die `.bashrc` wird vorher einmalig nach `~/.bashrc.wslui-backup` gesichert.
 

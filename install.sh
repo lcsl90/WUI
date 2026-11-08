@@ -40,6 +40,11 @@ if [ "$UNINSTALL" = 1 ]; then
   exit 0
 fi
 
+# Update einer bestehenden Installation ohne Option: Autostart-Einstellung beibehalten
+if [ "$AUTOSTART" = ask ] && [ -f "$APP_DIR/wslui.py" ]; then
+  if [ -f "$CFG_DIR/autostart" ]; then AUTOSTART=yes; else AUTOSTART=no; fi
+fi
+
 echo "${c_info}▶ Installiere WSLUI nach $APP_DIR${c_off}"
 if ! python3 -c 'import venv, ensurepip' >/dev/null 2>&1; then
   echo "python3-venv fehlt. Bitte zuerst ausführen:  sudo apt install -y python3-venv" >&2
