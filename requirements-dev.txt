@@ -1,0 +1,6 @@
+# Laufzeit (wie install.sh)
+textual>=8,<9
+pyte>=0.8
+# Tests
+pytest>=8
+pytest-asyncio>=0.23
