@@ -4,7 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import wslui
-from conftest import wait_until
+from conftest import wait_for_listing, wait_until
 
 
 async def test_app_starts_with_default_two_pane_layout(tmp_path: Path) -> None:
@@ -13,8 +13,8 @@ async def test_app_starts_with_default_two_pane_layout(tmp_path: Path) -> None:
 
     async with app.run_test(size=(120, 40)) as pilot:
         screen = app.screen
-        await wait_until(pilot, lambda: len(screen.panes) == 2 and all(p.view for p in screen.panes))
+        await wait_until(pilot, lambda: len(screen.panes) == 2)
 
         first = screen.panes[0]
+        await wait_for_listing(pilot, first, ["..", "hello.txt"])
         assert first.path == tmp_path
-        assert "hello.txt" in [e.name for e in first.view]

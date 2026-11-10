@@ -16,7 +16,7 @@ import threading
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Protocol, runtime_checkable
 
 from rich.syntax import Syntax
 from rich.text import Text
@@ -121,28 +121,50 @@ def from_windows_path(text: str) -> str:
     return t
 
 
-def copy_to_clipboard(app: App, text: str) -> None:
-    """Kopiert über clip.exe in die Windows-Zwischenablage (Fallback: OSC 52)."""
+@runtime_checkable
+class Clipboard(Protocol):
+    """Zugriff auf die Zwischenablage des Systems (unter WSL: die von Windows)."""
 
-    def run() -> None:
-        ok = False
+    def copy(self, text: str) -> None:
+        """Kopiert `text` (darf asynchron erfolgen, blockiert nicht)."""
+
+    def paste(self) -> str:
+        """Liefert den aktuellen Text (darf blockieren – nur aus Worker-Threads aufrufen)."""
+
+
+def windows_clipboard_payload(text: str) -> bytes:
+    """clip.exe erwartet UTF-16 mit BOM; Windows-Programme erwarten CRLF-Zeilenenden."""
+    crlf = text.replace("\r\n", "\n").replace("\n", "\r\n")
+    return b"\xff\xfe" + crlf.encode("utf-16-le")
+
+
+class SystemClipboard:
+    """Windows-Zwischenablage über clip.exe/PowerShell; außerhalb von WSL OSC 52 bzw. wl-paste/xclip."""
+
+    def __init__(self, app: App) -> None:
+        self._app = app
+
+    def copy(self, text: str) -> None:
+        threading.Thread(target=self._copy_blocking, args=(text,), daemon=True).start()
+
+    def _copy_blocking(self, text: str) -> None:
         if IS_WSL and shutil.which("clip.exe"):
             try:
                 subprocess.run(
                     ["clip.exe"],
-                    input=b"\xff\xfe" + text.encode("utf-16-le"),
+                    input=windows_clipboard_payload(text),
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     timeout=5,
                     check=True,
                 )
-                ok = True
+                return
             except (OSError, subprocess.SubprocessError):
-                ok = False
-        if not ok:
-            app.call_from_thread(app.copy_to_clipboard, text)
+                pass
+        self._app.call_from_thread(self._app.copy_to_clipboard, text)
 
-    threading.Thread(target=run, daemon=True).start()
+    def paste(self) -> str:
+        return read_clipboard()
 
 
 def read_clipboard() -> str:
@@ -872,7 +894,7 @@ class Pane(Vertical):
     def entry_clicked(self) -> None:
         e = self.current
         if e and not e.is_parent and self.cfg["click_copy"]:
-            copy_to_clipboard(self.app, e.name)
+            self.app.sys_clipboard.copy(e.name)  # type: ignore[attr-defined]
             self.app.notify(f"📋 {e.name}", title="Name kopiert", timeout=2)
 
     # ---------- Markieren / Sortieren / Filter ----------
@@ -1347,7 +1369,7 @@ class TerminalView(Widget, can_focus=True):
 
     @work(thread=True, exclusive=True, group="paste")
     def paste_from_clipboard(self) -> None:
-        text = read_clipboard()
+        text = self.app.sys_clipboard.paste()  # type: ignore[attr-defined]
         self.app.call_from_thread(self.paste_text, text)
 
     def on_paste(self, event: events.Paste) -> None:
@@ -1974,7 +1996,7 @@ class MainScreen(Screen):
             wins = [to_windows_path(e.path) for e in sel]
             text = wins[0] if len(wins) == 1 else " ".join(f'"{w}"' for w in wins)
             title = "Windows-Pfad kopiert"
-        copy_to_clipboard(self.app, text)
+        self.app.sys_clipboard.copy(text)  # type: ignore[attr-defined]
         shown = text if len(text) < 80 else text[:77] + "…"
         self.app.notify(f"📋 {shown}", title=title + (f" ({len(sel)})" if len(sel) > 1 else ""), timeout=2.5)
 
@@ -2476,10 +2498,12 @@ class WSLUI(App):
     """
     BINDINGS = [Binding("ctrl+q", "quit", "Beenden", show=False, priority=True)]
 
-    def __init__(self, start_path: Path | None) -> None:
+    def __init__(self, start_path: Path | None, clipboard: Clipboard | None = None) -> None:
         super().__init__()
         self.cfg = load_config()
         self.start_path = start_path
+        # Nicht `clipboard` nennen – das ist in Textual bereits die app-interne Zwischenablage.
+        self.sys_clipboard: Clipboard = clipboard or SystemClipboard(self)
         self.final_dir: str | None = None
         self.main_screen: MainScreen | None = None
 
