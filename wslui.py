@@ -57,6 +57,7 @@ DEFAULT_CONFIG = {
     "show_hidden": False,
     "click_copy": True,
     "preview": False,
+    "editor": "nano",  # Editor für „Öffnen“ – läuft eingebettet rechts neben den Dateien
     "panes": [],
     "bookmarks": [],
 }
@@ -429,6 +430,49 @@ def list_dir(path: Path) -> list[Entry]:
             e.kind = classify(e, on_drvfs)
             entries.append(e)
     return entries
+
+
+# --------------------------------------------------------------------------- #
+# Öffnen: eingebetteter Editor oder Windows-Programm?
+# --------------------------------------------------------------------------- #
+
+# Diese Typen sind auch als Text kaum sinnvoll in nano zu bearbeiten
+_WINDOWS_KINDS = {"image", "audio", "video", "pdf", "archive", "winexe"}
+_WINDOWS_EXTS = {".doc", ".docx", ".odt", ".rtf", ".xls", ".xlsx", ".ods", ".ppt", ".pptx", ".odp"}
+_TEXT_EXTS = {".svg"}  # als "image" eingestuft, aber Text
+
+
+def looks_binary(head: bytes) -> bool:
+    """Heuristik wie bei git/grep: NUL-Bytes am Dateianfang → Binärdatei."""
+    return b"\x00" in head
+
+
+def opens_in_editor(entry: Entry) -> bool:
+    """Textdateien öffnen im eingebetteten Editor, alles andere mit dem Windows-Programm."""
+    ext = os.path.splitext(entry.name.lower())[1]
+    if ext not in _TEXT_EXTS and (entry.kind in _WINDOWS_KINDS or ext in _WINDOWS_EXTS):
+        return False
+    try:
+        with open(entry.path, "rb") as fh:
+            return not looks_binary(fh.read(8192))
+    except OSError:
+        return True  # der Editor zeigt das Problem (z. B. fehlende Rechte) selbst an
+
+
+def editor_command(
+    editor: str, path: Path, which: Callable[[str], str | None] = shutil.which
+) -> list[str] | None:
+    """Kommandozeile für den eingebetteten Editor – None, wenn er nicht installiert ist.
+
+    Der Pfad ist absolut (beginnt mit '/'), kann also nie als Option missverstanden werden.
+    """
+    try:
+        argv = shlex.split(editor) or ["nano"]
+    except ValueError:  # z. B. unbalancierte Anführungszeichen in der Konfiguration
+        return None
+    if not which(argv[0]):
+        return None
+    return [*argv, str(path)]
 
 
 _num = re.compile(r"(\d+)")
@@ -1138,6 +1182,17 @@ _KEY_SEQ = {
     "f11": "\x1b[23~",
 }
 _ARROWS = {"up": "A", "down": "B", "right": "C", "left": "D"}
+_ALT_SCREEN_MODES = {47 << 5, 1047 << 5, 1049 << 5}  # Vollbildprogramme wie nano, less, vim
+_WHEEL_LINES = 3
+
+
+def wheel_input(up: bool, alt_screen: bool, app_cursor: bool) -> str | None:
+    """Eingabe fürs Mausrad: im Vollbildprogramm Pfeiltasten (wie Windows Terminal),
+    sonst None – dann blättert das Terminal im eigenen Verlauf."""
+    if not alt_screen:
+        return None
+    arrow = ("\x1bO" if app_cursor else "\x1b[") + ("A" if up else "B")
+    return arrow * _WHEEL_LINES
 
 
 # --------------------------------------------------------------------------- #
