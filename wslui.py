@@ -16,7 +16,7 @@ import threading
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Iterable, Protocol, Sequence, runtime_checkable
+from typing import Callable, Collection, Iterable, Literal, Protocol, Sequence, runtime_checkable
 
 from rich.syntax import Syntax
 from rich.text import Text
@@ -525,6 +525,55 @@ def shell_join(items: list[str]) -> str:
     if len(items) == 1:
         return items[0]
     return " ".join(shlex.quote(i) for i in items)
+
+
+# --------------------------------------------------------------------------- #
+# Drag & Drop: Regeln (reine Logik)
+# --------------------------------------------------------------------------- #
+
+DropAction = Literal["copy", "move"]
+
+
+def drop_dir(pane_dir: Path, hovered: Entry | None, dragged: Collection[Path]) -> Path:
+    """Zielordner beim Ablegen: der Ordner unter der Maus ('..' = übergeordneter Ordner),
+    sonst der Ordner des Fensters. Auf sich selbst lässt sich ein Ordner nicht ablegen."""
+    if hovered is not None and hovered.is_dir and hovered.path not in dragged:
+        return hovered.path
+    return pane_dir
+
+
+def is_noop_drop(sources: Sequence[Path], target: Path) -> bool:
+    """Nichts zu tun, wenn alle Quellen bereits im Zielordner liegen."""
+    return all(src.parent == target for src in sources)
+
+
+def drop_action_from_modifiers(ctrl: bool, shift: bool) -> DropAction | None:
+    """Wie im Windows-Explorer: Strg = kopieren, Shift = verschieben; ohne Taste → nachfragen."""
+    if ctrl:
+        return "copy"
+    if shift:
+        return "move"
+    return None
+
+
+def preferred_drop_action(
+    sources: Sequence[Path], target: Path, device: Callable[[Path], int] = lambda p: os.lstat(p).st_dev
+) -> DropAction:
+    """Vorschlag wie im Windows-Explorer: gleiches Laufwerk → verschieben, sonst kopieren."""
+    try:
+        target_dev = device(target)
+        same_drive = all(device(src) == target_dev for src in sources)
+    except OSError:
+        return "copy"
+    return "move" if same_drive else "copy"
+
+
+def drop_menu_items(preferred: DropAction) -> list[tuple[str, str, str]]:
+    """Menü nach dem Ablegen – der Vorschlag steht oben (Enter wählt ihn)."""
+    move = ("move", "Hierher verschieben", "Shift")
+    copy = ("copy", "Hierher kopieren", "Strg")
+    first, second = (move, copy) if preferred == "move" else (copy, move)
+    return [first, second, ("sep", "", ""), ("cancel", "Abbrechen", "Esc")]
 
 
 # --------------------------------------------------------------------------- #
