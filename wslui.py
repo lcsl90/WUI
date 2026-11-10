@@ -1179,7 +1179,7 @@ class TextSelection:
 
     def extract(self, lines: Sequence[ScreenLine]) -> str:
         """Der markierte Text 1:1 – umbrochene Zeilen ohne künstlichen Zeilenumbruch,
-        Füll-Leerzeichen am Zeilenende entfernt (wie Windows Terminal)."""
+        Füll-Leerzeichen am Zeilenende und leere Zeilen am Ende der Auswahl entfernt."""
         (sx, sy), (ex, ey) = self.start, self.end
         ey = min(ey, len(lines) - 1)
         parts: list[str] = []
@@ -1194,7 +1194,7 @@ class TextSelection:
             parts.append(text if continues else text.rstrip(" "))
             if y < ey and not continues:
                 parts.append("\n")
-        return "".join(parts)
+        return "".join(parts).rstrip("\n")
 
 
 def screen_lines(screen) -> list[ScreenLine]:
@@ -1258,10 +1258,23 @@ def _pyte_color(c: str) -> str | None:
     return c
 
 
+def copied_notice(text: str) -> str:
+    """Kurzer Toast-Text zu kopiertem Text: erste Zeile (gekürzt) und Anzahl weiterer Zeilen."""
+    first, *rest = text.split("\n")
+    if len(first) > 60:
+        first = first[:59] + "…"
+    more = f"  (+{len(rest)} Zeile{'' if len(rest) == 1 else 'n'})" if rest else ""
+    return f"📋 {first}{more}"
+
+
 class TerminalView(Widget, can_focus=True):
-    """Ein echtes Shell-Terminal als Widget (Bash in einem Pseudo-Terminal)."""
+    """Ein echtes Shell-Terminal als Widget (Bash in einem Pseudo-Terminal).
+
+    Markieren mit der Maus kopiert beim Loslassen sofort in die Zwischenablage.
+    """
 
     DEFAULT_CSS = "TerminalView { height: 1fr; width: 1fr; }"
+    ALLOW_SELECT = False  # eigene Auswahl statt der von Textual (die nur per Ctrl+C kopiert)
 
     class Exited(Message):
         pass
@@ -1276,19 +1289,36 @@ class TerminalView(Widget, can_focus=True):
         self._dirty = False
         self._styles: dict[tuple, Style] = {}
         self.start_dir: str = str(HOME)
+        self.selection: TextSelection | None = None
+        self._sel_anchor: Cell | None = None
 
     # ---------- Prozess ----------
     @property
     def running(self) -> bool:
         return self.fd is not None and self.proc is not None and self.proc.poll() is None
 
+    def reset_screen(self) -> None:
+        """Legt einen frischen, zur Widget-Größe passenden Terminal-Bildschirm an."""
+        cols, rows = max(self.size.width, 20), max(self.size.height, 3)
+        screen = WrapTrackingScreen(cols, rows, history=5000, ratio=0.5)
+        screen.write_process_input = self._write_str  # Antworten auf Terminal-Abfragen
+        with self.lock:
+            self.pscreen = screen
+            self.stream = pyte.ByteStream(screen)
+        self._set_selection(None)
+
+    def feed(self, data: bytes) -> None:
+        """Verarbeitet Ausgabe des Programms (thread-sicher; neu gezeichnet wird im Tick)."""
+        with self.lock:
+            if self.stream is not None:
+                self.stream.feed(data)
+        self._dirty = True
+
     def start(self) -> None:
         if pyte is None or self.running:
             return
-        cols, rows = max(self.size.width, 20), max(self.size.height, 3)
-        self.pscreen = pyte.HistoryScreen(cols, rows, history=5000, ratio=0.5)
-        self.pscreen.write_process_input = self._write_str  # Antworten auf Terminal-Abfragen
-        self.stream = pyte.ByteStream(self.pscreen)
+        self.reset_screen()
+        cols, rows = self.pscreen.columns, self.pscreen.lines
         master, slave = os.openpty()
         self._set_winsize(slave, rows, cols)
         env = dict(os.environ, TERM="xterm-256color", COLORTERM="truecolor", WSLUI_ACTIVE="1")
@@ -1314,10 +1344,7 @@ class TerminalView(Widget, can_focus=True):
                 break
             if not data:
                 break
-            with self.lock:
-                if self.stream is not None:
-                    self.stream.feed(data)
-            self._dirty = True
+            self.feed(data)
         try:
             self.app.call_from_thread(self._on_exited, fd)
         except Exception:  # noqa: BLE001  (App bereits beendet)
@@ -1406,6 +1433,7 @@ class TerminalView(Widget, can_focus=True):
             self.pscreen.resize(rows, cols)
         if self.fd is not None:
             self._set_winsize(self.fd, rows, cols)
+        self._set_selection(None)
         self.refresh()
 
     # ---------- Eingabe ----------
@@ -1440,6 +1468,7 @@ class TerminalView(Widget, can_focus=True):
         return None
 
     async def on_key(self, event: events.Key) -> None:
+        self._set_selection(None)
         if not self.running:
             if event.key == "enter":
                 event.stop()
@@ -1488,6 +1517,7 @@ class TerminalView(Widget, can_focus=True):
             event.stop()
             with self.lock:
                 self.pscreen.prev_page()
+            self._set_selection(None)
             self.refresh()
 
     def on_mouse_scroll_down(self, event: events.MouseScrollDown) -> None:
@@ -1495,6 +1525,7 @@ class TerminalView(Widget, can_focus=True):
             event.stop()
             with self.lock:
                 self.pscreen.next_page()
+            self._set_selection(None)
             self.refresh()
 
     def on_click(self, event: events.Click) -> None:
@@ -1503,9 +1534,49 @@ class TerminalView(Widget, can_focus=True):
             event.stop()
             self.paste_from_clipboard()
 
+    # ---------- Maus: Markieren = Kopieren ----------
+    def _set_selection(self, selection: TextSelection | None) -> None:
+        if selection != self.selection:
+            self.selection = selection
+            self.refresh()
+
+    def _cell_at(self, event: events.MouseEvent) -> Cell:
+        """Zelle unter dem Mauszeiger – auf den Terminalbereich begrenzt (auch beim Ziehen nach außen)."""
+        scr = self.pscreen
+        return min(max(event.x, 0), scr.columns - 1), min(max(event.y, 0), scr.lines - 1)
+
+    def on_mouse_down(self, event: events.MouseDown) -> None:
+        if event.button != 1 or self.pscreen is None:
+            return
+        self._sel_anchor = self._cell_at(event)
+        self._set_selection(None)
+        self.capture_mouse()
+
+    def on_mouse_move(self, event: events.MouseMove) -> None:
+        if self._sel_anchor is None:
+            return
+        cell = self._cell_at(event)
+        if self.selection is not None or cell != self._sel_anchor:
+            self._set_selection(TextSelection(self._sel_anchor, cell))
+
+    def on_mouse_up(self, event: events.MouseUp) -> None:
+        if self._sel_anchor is None:
+            return
+        self._sel_anchor = None
+        self.release_mouse()
+        if self.selection is not None:
+            self._copy_selection(self.selection)
+
+    def _copy_selection(self, selection: TextSelection) -> None:
+        with self.lock:
+            text = selection.extract(screen_lines(self.pscreen))
+        if text:
+            self.app.sys_clipboard.copy(text)  # type: ignore[attr-defined]
+            self.app.notify(copied_notice(text), title="Text kopiert", timeout=2.5, markup=False)
+
     # ---------- Darstellung ----------
-    def _style(self, ch, cursor: bool) -> Style:
-        key = (ch.fg, ch.bg, ch.bold, ch.italics, ch.underscore, ch.strikethrough, ch.reverse, cursor)
+    def _style(self, ch, invert: bool) -> Style:
+        key = (ch.fg, ch.bg, ch.bold, ch.italics, ch.underscore, ch.strikethrough, ch.reverse, invert)
         st = self._styles.get(key)
         if st is None:
             st = Style(
@@ -1515,7 +1586,7 @@ class TerminalView(Widget, can_focus=True):
                 italic=ch.italics or None,
                 underline=ch.underscore or None,
                 strike=ch.strikethrough or None,
-                reverse=(ch.reverse != cursor) or None,
+                reverse=(ch.reverse != invert) or None,
             )
             self._styles[key] = st
         return st
@@ -1527,6 +1598,7 @@ class TerminalView(Widget, can_focus=True):
         if scr is None:
             return Text("Terminal startet …", style="dim")
         out = Text(no_wrap=True, overflow="crop")
+        sel = self.selection
         with self.lock:
             cur = scr.cursor
             scrolled = scr.history.position < scr.history.size
@@ -1539,7 +1611,9 @@ class TerminalView(Widget, can_focus=True):
                     ch = row[x]
                     if ch.data == "":
                         continue
-                    st = self._style(ch, show_cursor and y == cur.y and x == cur.x)
+                    is_cursor = show_cursor and y == cur.y and x == cur.x
+                    is_selected = sel is not None and sel.contains(x, y)
+                    st = self._style(ch, is_cursor != is_selected)
                     if st is not run_style and run:
                         out.append("".join(run), run_style)
                         run = []
@@ -1803,13 +1877,14 @@ HELP_MD = """\
 | `Ctrl+T` | Terminal unten ein-/ausblenden (läuft im Hintergrund weiter) |
 | `t` / `F12` | ins Terminal springen / zwischen Dateien und Terminal wechseln |
 | `Ctrl+↑` / `Ctrl+↓` | Terminal groß / normal |
+| **Maus ziehen** | markieren – beim Loslassen sofort kopiert (Hinweis unten rechts) |
 | `Ctrl+V`, `Shift+Einfg`, **Rechtsklick** | Einfügen – bereinigt, ohne `~[[200~`-Müll, ohne Auto-Enter |
 | Mausrad | im Verlauf zurückscrollen |
 | `T` | Vollbild-Shell (mit `exit` zurück) |
 
 Das Terminal wechselt automatisch in den Ordner des aktiven Fensters – und umgekehrt
 folgt das Fenster, wenn du im Terminal mit `cd` woanders hin gehst.
-Text im Terminal markieren: **Shift** gedrückt halten und mit der Maus ziehen.
+Markierter Text wird 1:1 kopiert – umbrochene lange Zeilen (z. B. URLs) bleiben am Stück.
 
 ## Kopieren in die Zwischenablage
 | Taste | Kopiert |

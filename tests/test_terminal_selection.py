@@ -70,6 +70,11 @@ def test_extract_starting_on_second_half_of_wide_character_includes_it() -> None
     assert TextSelection((3, 0), (4, 0)).extract([ScreenLine(cells)]) == "本"
 
 
+def test_extract_drops_trailing_empty_lines_but_keeps_inner_ones() -> None:
+    lines = [line("a"), line(""), line("b"), line(""), line("")]
+    assert TextSelection((0, 0), (9, 4)).extract(lines) == "a\n\nb"
+
+
 def test_extract_ignores_rows_beyond_screen() -> None:
     assert TextSelection((0, 0), (5, 9)).extract([line("only")]) == "only"
 

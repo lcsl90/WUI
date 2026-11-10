@@ -8,6 +8,7 @@ Ein moderner, mausfreundlicher Dateimanager mit eingebautem Terminal für die WS
 - **8 Fenster-Layouts**: ½|½, ½|¼¼, 4×¼, ½/½, ⅓×3 … (Tasten `1`–`8` oder oben anklicken)
 - **Terminal unten** (`Ctrl+T`) für git & Co. – folgt automatisch dem aktuellen Ordner
 - **Sauberes Einfügen** mit `Ctrl+V` / Rechtsklick – ohne `~[[200~`-Sonderzeichen
+- **Markieren = Kopieren** im Terminal: Maus ziehen, loslassen – fertig
 - Farbige Dateitypen + Icons, Vorschau mit Syntax-Highlighting, Favoriten & Laufwerke
 - **Autostart** beim Öffnen von WSL (abschaltbar)
 
@@ -79,5 +80,6 @@ Beenden mit `q` – die Shell steht danach im zuletzt geöffneten Ordner.
 ## Tipps
 
 - Icons sehen mit einer [Nerd Font](https://www.nerdfonts.com/) noch besser aus – mit `i` umschalten (Emoji / Nerd Font / Einfach).
-- Text im Terminal markieren: **Shift** halten und mit der Maus ziehen (Windows-Terminal-Auswahl).
+- Text im Terminal mit der Maus markieren – beim Loslassen ist er sofort 1:1 in der Zwischenablage
+  (Hinweis unten rechts). Umbrochene lange Zeilen wie URLs bleiben dabei am Stück.
 - Einstellungen liegen in `~/.config/wslui/config.json`.
