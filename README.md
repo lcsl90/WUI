@@ -8,7 +8,9 @@ Ein moderner, mausfreundlicher Dateimanager mit eingebautem Terminal für die WS
 - **Rechtsklick** öffnet ein Kontextmenü (Öffnen, In Windows öffnen, Pfad / Windows-Pfad kopieren,
   Explorer, VS Code, Umbenennen …)
 - **Drag & Drop** zwischen Fenstern: Datei(en) auf ein anderes Fenster oder einen Ordner ziehen,
-  loslassen, *Hierher verschieben* / *Hierher kopieren* wählen (mit `Strg` bzw. `Shift` ohne Nachfrage)
+  loslassen, *Hierher verschieben* / *Hierher kopieren* wählen. Mit `Strg` bzw. `Shift` beim Loslassen
+  geht es ohne Nachfrage – sofern das Terminal die Taste weitergibt (Windows Terminal nutzt
+  Shift+Maus selbst für seine Textauswahl)
 - **8 Fenster-Layouts**: ½|½, ½|¼¼, 4×¼, ½/½, ⅓×3 … (Tasten `1`–`8` oder oben anklicken)
 - **Terminal unten** (`Ctrl+T`) für git & Co. – folgt automatisch dem aktuellen Ordner
 - **Sauberes Einfügen** mit `Ctrl+V` / Rechtsklick – ohne `~[[200~`-Sonderzeichen
@@ -81,6 +83,19 @@ Beenden mit `q` – die Shell steht danach im zuletzt geöffneten Ordner.
 | `.` | versteckte Dateien |
 | `Ctrl+P` | Befehlspalette (u. a. Farbschema) |
 | `?` | komplette Hilfe |
+
+## Entwicklung
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
+```
+
+```bash
+.venv/bin/pytest
+```
+
+Die Tests steuern die App headless über Textuals Pilot (Maus, Tastatur) und nutzen eine
+Fake-Zwischenablage; der nano-Test wird übersprungen, wenn nano nicht installiert ist.
 
 ## Tipps
 

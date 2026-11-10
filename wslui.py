@@ -2227,7 +2227,7 @@ HELP_MD = """\
 | **Doppelklick** | Ordner öffnen · Textdatei im Editor rechts (nano) · sonst Windows-Programm |
 | **Rechtsklick** | Kontextmenü (Öffnen, In Windows öffnen, Pfad, Explorer, Umbenennen …) |
 | **Ziehen** auf ein anderes Fenster / einen Ordner | verschieben oder kopieren – Menü beim Loslassen |
-| … mit `Strg` / `Shift` beim Loslassen | sofort kopieren / sofort verschieben |
+| … mit `Strg` / `Shift` beim Loslassen | ohne Nachfrage kopieren / verschieben (falls das Terminal die Taste weitergibt) |
 | Klick auf **Pfadleiste** | direkt in diesen Ordner springen |
 | Klick auf **Spaltenkopf** | sortieren (nochmal = umdrehen) |
 | Klick auf **Layout-Buttons** oben | Fensteraufteilung wechseln |
