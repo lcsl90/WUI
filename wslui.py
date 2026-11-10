@@ -16,7 +16,7 @@ import threading
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Iterable, Protocol, runtime_checkable
+from typing import Callable, Iterable, Protocol, Sequence, runtime_checkable
 
 from rich.syntax import Syntax
 from rich.text import Text
@@ -1138,6 +1138,111 @@ _KEY_SEQ = {
     "f11": "\x1b[23~",
 }
 _ARROWS = {"up": "A", "down": "B", "right": "C", "left": "D"}
+
+
+# --------------------------------------------------------------------------- #
+# Terminal-Textauswahl (reine Logik – ohne UI testbar)
+# --------------------------------------------------------------------------- #
+
+Cell = tuple[int, int]  # (Spalte, Zeile) im sichtbaren Terminalbereich
+
+
+def _reading_order(cell: Cell) -> tuple[int, int]:
+    return cell[1], cell[0]
+
+
+@dataclass(frozen=True)
+class ScreenLine:
+    """Eine Terminalzeile als Zellen ("" = rechte Hälfte eines doppelt breiten Zeichens)."""
+
+    cells: tuple[str, ...]
+    wrapped: bool = False  # endet durch automatischen Umbruch und geht in der nächsten Zeile weiter
+
+
+@dataclass(frozen=True)
+class TextSelection:
+    """Fließtext-Auswahl wie in Terminals üblich: von `anchor` bis `cursor`, beide Zellen inklusive."""
+
+    anchor: Cell
+    cursor: Cell
+
+    @property
+    def start(self) -> Cell:
+        return min(self.anchor, self.cursor, key=_reading_order)
+
+    @property
+    def end(self) -> Cell:
+        return max(self.anchor, self.cursor, key=_reading_order)
+
+    def contains(self, x: int, y: int) -> bool:
+        return _reading_order(self.start) <= (y, x) <= _reading_order(self.end)
+
+    def extract(self, lines: Sequence[ScreenLine]) -> str:
+        """Der markierte Text 1:1 – umbrochene Zeilen ohne künstlichen Zeilenumbruch,
+        Füll-Leerzeichen am Zeilenende entfernt (wie Windows Terminal)."""
+        (sx, sy), (ex, ey) = self.start, self.end
+        ey = min(ey, len(lines) - 1)
+        parts: list[str] = []
+        for y in range(sy, ey + 1):
+            cells = lines[y].cells
+            x0 = sx if y == sy else 0
+            x1 = ex if y == ey else len(cells) - 1
+            if 0 < x0 < len(cells) and cells[x0] == "":
+                x0 -= 1  # Auswahl beginnt auf der rechten Hälfte eines breiten Zeichens
+            text = "".join(cells[x0 : x1 + 1])
+            continues = y < ey and lines[y].wrapped
+            parts.append(text if continues else text.rstrip(" "))
+            if y < ey and not continues:
+                parts.append("\n")
+        return "".join(parts)
+
+
+def screen_lines(screen) -> list[ScreenLine]:
+    """Der sichtbare Inhalt eines pyte-Screens als ScreenLines."""
+    columns = range(screen.columns)
+    lines = []
+    for y in range(screen.lines):
+        row = screen.buffer[y]
+        lines.append(ScreenLine(tuple(row[x].data for x in columns), getattr(row, "wrapped", False)))
+    return lines
+
+
+class WrapTrackingScreen(pyte.HistoryScreen if pyte is not None else object):  # type: ignore[misc]
+    """pyte-HistoryScreen, der sich merkt, welche Zeilen durch automatischen Umbruch enden.
+
+    Das Flag hängt an der Zeile selbst und wandert so beim Scrollen mit in den Verlauf.
+    Damit lässt sich ein umbrochener Befehl oder eine lange URL 1:1 kopieren.
+    """
+
+    _in_draw = False
+
+    @staticmethod
+    def _mark(row, wrapped: bool) -> None:
+        row.wrapped = wrapped
+
+    def draw(self, data: str) -> None:
+        self._in_draw = True
+        try:
+            super().draw(data)
+        finally:
+            self._in_draw = False
+
+    def linefeed(self) -> None:
+        # Innerhalb von draw() gibt es einen Zeilenvorschub nur beim automatischen Umbruch;
+        # ein "\n" des Programms beendet die Zeile dagegen explizit.
+        self._mark(self.buffer[self.cursor.y], self._in_draw)
+        super().linefeed()
+
+    def erase_in_line(self, how: int = 0, private: bool = False) -> None:
+        super().erase_in_line(how, private)
+        if how in (0, 2):
+            self._mark(self.buffer[self.cursor.y], False)
+
+    def erase_in_display(self, how: int = 0, *args, **kwargs) -> None:
+        super().erase_in_display(how, *args, **kwargs)
+        rows = {0: range(self.cursor.y + 1, self.lines), 1: range(self.cursor.y)}.get(how, range(self.lines))
+        for y in rows:
+            self._mark(self.buffer[y], False)
 
 
 def _pyte_color(c: str) -> str | None:
