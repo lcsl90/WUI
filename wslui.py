@@ -929,11 +929,22 @@ class Pane(Vertical):
             self.goto(e.path)
         elif e.broken:
             self.app.notify("Defekter Symlink", severity="warning")
+        elif opens_in_editor(e):
+            self.screen.open_in_editor(e.path)  # type: ignore[attr-defined]
         else:
-            if open_external(e.path):
-                self.app.notify(f"Öffne {e.name} …", timeout=2)
-            else:
-                self.app.notify("Kein Programm zum Öffnen gefunden", severity="error")
+            self.open_in_windows()
+
+    def open_in_windows(self) -> None:
+        """Öffnet den Eintrag mit dem Windows-Standardprogramm (außerhalb von WSL: xdg-open)."""
+        e = self.current
+        if e is None or e.is_parent:
+            return
+        if e.broken:
+            self.app.notify("Defekter Symlink", severity="warning")
+        elif open_external(e.path):
+            self.app.notify(f"Öffne {e.name} …", timeout=2, markup=False)
+        else:
+            self.app.notify("Kein Programm zum Öffnen gefunden", severity="error")
 
     def entry_clicked(self) -> None:
         e = self.current
@@ -1020,12 +1031,12 @@ class Pane(Vertical):
                 items.append(("copy_win", "Windows-Pfad kopieren", "w"))
             items.append(("sep", "", ""))
         items.append(("open", "Öffnen", "Enter"))
+        if not e.is_dir:
+            items.append(("open_windows", "In Windows öffnen" if IS_WSL else "Mit System öffnen", "O"))
         if IS_WSL:
             items.append(("reveal", "Im Explorer zeigen", "o"))
         if shutil.which("code"):
             items.append(("vscode", "In VS Code öffnen", "C"))
-        if not e.is_dir:
-            items.append(("edit", "Im Editor bearbeiten", "e"))
         items.append(("terminal", "Terminal hier", "t"))
         if not e.is_parent:
             items += [
@@ -1332,7 +1343,15 @@ class TerminalView(Widget, can_focus=True):
     ALLOW_SELECT = False  # eigene Auswahl statt der von Textual (die nur per Ctrl+C kopiert)
 
     class Exited(Message):
-        pass
+        """Der Prozess im Terminal hat sich beendet."""
+
+        def __init__(self, view: "TerminalView") -> None:
+            super().__init__()
+            self.view = view
+
+        @property
+        def control(self) -> "TerminalView":
+            return self.view
 
     def __init__(self, **kw) -> None:
         super().__init__(**kw)
@@ -1344,6 +1363,7 @@ class TerminalView(Widget, can_focus=True):
         self._dirty = False
         self._styles: dict[tuple, Style] = {}
         self.start_dir: str = str(HOME)
+        self.command: list[str] | None = None  # None = interaktive Shell
         self.selection: TextSelection | None = None
         self._sel_anchor: Cell | None = None
 
@@ -1379,8 +1399,9 @@ class TerminalView(Widget, can_focus=True):
         env = dict(os.environ, TERM="xterm-256color", COLORTERM="truecolor", WSLUI_ACTIVE="1")
         for k in ("COLUMNS", "LINES"):
             env.pop(k, None)
-        sh = os.environ.get("SHELL") or "/bin/bash"
-        cmd = ["setsid", "-c", "-w", sh, "-i"] if shutil.which("setsid") else [sh, "-i"]
+        argv = self.command or [os.environ.get("SHELL") or "/bin/bash", "-i"]
+        # eigene Sitzung mit dem PTY als Kontrollterminal (Job-Control, Ctrl+C/Ctrl+Z)
+        cmd = ["setsid", "-c", "-w", *argv] if shutil.which("setsid") else argv
         cwd = self.start_dir if os.path.isdir(self.start_dir) else str(HOME)
         try:
             self.proc = subprocess.Popen(
@@ -1412,7 +1433,7 @@ class TerminalView(Widget, can_focus=True):
             except OSError:
                 pass
             self.fd = None
-            self.post_message(self.Exited())
+            self.post_message(self.Exited(self))
 
     def stop(self) -> None:
         if self.proc and self.proc.poll() is None:
@@ -1567,21 +1588,34 @@ class TerminalView(Widget, can_focus=True):
         event.stop()
         self.paste_text(event.text)
 
+    @property
+    def in_alt_screen(self) -> bool:
+        """True, solange ein Vollbildprogramm (nano, less, vim …) läuft."""
+        return self.pscreen is not None and not _ALT_SCREEN_MODES.isdisjoint(self.pscreen.mode)
+
+    def _scroll(self, up: bool) -> None:
+        scr = self.pscreen
+        if scr is None:
+            return
+        keys = wheel_input(up, self.in_alt_screen, _MODE_DECCKM in scr.mode) if self.running else None
+        if keys is not None:
+            self.write(keys.encode())
+            return
+        with self.lock:
+            if up:
+                scr.prev_page()
+            else:
+                scr.next_page()
+        self._set_selection(None)
+        self.refresh()
+
     def on_mouse_scroll_up(self, event: events.MouseScrollUp) -> None:
-        if self.pscreen is not None:
-            event.stop()
-            with self.lock:
-                self.pscreen.prev_page()
-            self._set_selection(None)
-            self.refresh()
+        event.stop()
+        self._scroll(up=True)
 
     def on_mouse_scroll_down(self, event: events.MouseScrollDown) -> None:
-        if self.pscreen is not None:
-            event.stop()
-            with self.lock:
-                self.pscreen.next_page()
-            self._set_selection(None)
-            self.refresh()
+        event.stop()
+        self._scroll(up=False)
 
     def on_click(self, event: events.Click) -> None:
         self.focus()
@@ -1694,11 +1728,59 @@ class TerminalPanel(Vertical):
     """
 
     def compose(self) -> ComposeResult:
-        yield TerminalView()
+        yield TerminalView(id="term-view")
 
     def on_mount(self) -> None:
         self.border_title = Text(" >_ Terminal ", style="bold")
         self.border_subtitle = Text(" Ctrl+T ein/aus · F12 Fenster wechseln · Ctrl+↑ größer ")
+
+
+class EditorPanel(Vertical):
+    """Eingebetteter Editor (standardmäßig nano) rechts neben den Dateifenstern.
+
+    Schließt sich von selbst, sobald der Editor beendet wird (bei nano: Ctrl+X).
+    """
+
+    DEFAULT_CSS = """
+    EditorPanel {
+        display: none; width: 55%; height: 1fr;
+        border: round $panel-lighten-2; border-title-color: $text-muted;
+        border-subtitle-color: $text-muted; border-subtitle-align: right;
+    }
+    EditorPanel.-on { display: block; }
+    EditorPanel:focus-within { border: round $success; border-title-color: $success; }
+    """
+
+    def __init__(self, **kw) -> None:
+        super().__init__(**kw)
+        self.path: Path | None = None
+
+    def compose(self) -> ComposeResult:
+        yield TerminalView(id="editor-view")
+
+    @property
+    def view(self) -> TerminalView:
+        return self.query_one("#editor-view", TerminalView)
+
+    @property
+    def is_open(self) -> bool:
+        return self.has_class("-on")
+
+    def open(self, path: Path, argv: list[str]) -> None:
+        self.path = path
+        self.border_title = Text(f" ✎ {path.name} ", style="bold")
+        self.border_subtitle = Text(" Ctrl+X schließen · F12 Fenster wechseln ")
+        self.add_class("-on")
+        view = self.view
+        view.command = argv
+        view.start_dir = str(path.parent)
+        self.call_after_refresh(view.start)  # erst nach dem Layout, damit die Größe stimmt
+        view.focus()
+
+    def close(self) -> None:
+        self.view.stop()
+        self.remove_class("-on")
+        self.path = None
 
 
 # --------------------------------------------------------------------------- #
@@ -1804,9 +1886,10 @@ class ConfirmDialog(ModalScreen[bool]):
         Binding("y,j", "yes", show=False),
     ]
 
-    def __init__(self, message: str, yes_label: str = "Ja", danger: bool = True) -> None:
+    def __init__(self, message: str, yes_label: str = "Ja", danger: bool = True, default_yes: bool = True) -> None:
         super().__init__()
         self.message, self.yes_label, self.danger = message, yes_label, danger
+        self.default_yes = default_yes
 
     def compose(self) -> ComposeResult:
         with Vertical():
@@ -1816,7 +1899,7 @@ class ConfirmDialog(ModalScreen[bool]):
                 yield Button(self.yes_label, id="yes", variant="error" if self.danger else "primary")
 
     def on_mount(self) -> None:
-        self.query_one("#yes", Button).focus()
+        self.query_one("#yes" if self.default_yes else "#no", Button).focus()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.dismiss(event.button.id == "yes")
@@ -1896,8 +1979,8 @@ HELP_MD = """\
 | Aktion | Wirkung |
 |---|---|
 | **Klick** auf Datei/Ordner | auswählen **und Namen kopieren** |
-| **Doppelklick** | Ordner öffnen / Datei mit Windows-Programm öffnen |
-| **Rechtsklick** | Kontextmenü (Pfad, Windows-Pfad, Explorer, Umbenennen …) |
+| **Doppelklick** | Ordner öffnen · Textdatei im Editor rechts (nano) · sonst Windows-Programm |
+| **Rechtsklick** | Kontextmenü (Öffnen, In Windows öffnen, Pfad, Explorer, Umbenennen …) |
 | Klick auf **Pfadleiste** | direkt in diesen Ordner springen |
 | Klick auf **Spaltenkopf** | sortieren (nochmal = umdrehen) |
 | Klick auf **Layout-Buttons** oben | Fensteraufteilung wechseln |
@@ -1906,7 +1989,7 @@ HELP_MD = """\
 | Taste | Wirkung |
 |---|---|
 | `↑ ↓` / `j k` | bewegen |
-| `Enter` / `→` / `l` | öffnen |
+| `Enter` / `→` / `l` | öffnen (Textdateien im Editor rechts) |
 | `←` / `h` / `Backspace` | eine Ebene hoch |
 | `~` | Home · `\\` = Root · `g` = Pfad eingeben (auch `C:\\...`) |
 | `b` | Favoriten & Laufwerke · `B` = aktuellen Ordner merken |
@@ -1925,6 +2008,19 @@ HELP_MD = """\
 | `7` | viertel/viertel \\| halb |
 | `8` | halb oben / zwei Viertel unten |
 | `P` | Vorschau-Spalte an/aus |
+
+## Editor (rechts neben den Dateien)
+| Taste | Wirkung |
+|---|---|
+| `Enter`, Doppelklick, Kontextmenü **Öffnen** | Textdatei in **nano** öffnen |
+| `e` | im Editor öffnen – auch Dateien, die sonst an Windows gingen |
+| `O` / Kontextmenü **In Windows öffnen** | mit dem Windows-Standardprogramm öffnen |
+| `Ctrl+X` | Editor schließen (nano fragt bei Änderungen nach dem Speichern) |
+| `F12` | reihum: Dateien → Editor → Terminal |
+| Mausrad / **Maus ziehen** | scrollen / markieren und sofort kopieren |
+
+Bilder, PDFs, Office-Dokumente, Archive und andere Binärdateien öffnet **Öffnen**
+direkt mit dem Windows-Programm. Anderer Editor: `"editor"` in `~/.config/wslui/config.json`.
 
 ## Terminal (z. B. für git)
 | Taste | Wirkung |
@@ -1956,7 +2052,7 @@ Markierter Text wird 1:1 kopiert – umbrochene lange Zeilen (z. B. URLs) bleibe
 | `F5` / `F6` | in das andere Fenster kopieren / verschieben |
 | `F7` / `n` | neuer Ordner / neue Datei |
 | `Entf` | löschen (mit Nachfrage) |
-| `e` | im `$EDITOR` öffnen · `C` = VS Code |
+| `e` / `O` | im Editor rechts / in Windows öffnen · `C` = VS Code |
 | `o` | im Windows-Explorer zeigen |
 | `.` | versteckte Dateien an/aus · `s` = Sortierung · `i` = Icon-Stil |
 | `R` | neu laden |
@@ -2030,6 +2126,7 @@ class MainScreen(Screen):
         Binding("T", "terminal", show=False),
         Binding("P", "toggle_preview", show=False),
         Binding("o", "reveal", show=False),
+        Binding("O", "open_windows", show=False),
         Binding("f2", "rename", show=False),
         Binding("f6", "fileop('move')", show=False),
         Binding("f7", "mkdir", show=False),
@@ -2076,6 +2173,7 @@ class MainScreen(Screen):
         with Horizontal(id="main"):
             yield Vertical(id="root")
             yield Preview(id="preview")
+            yield EditorPanel(id="editor")
         yield TerminalPanel(id="termpanel")
         yield Footer()
 
@@ -2243,8 +2341,8 @@ class MainScreen(Screen):
             "copy_win": lambda: self.action_copy("win"),
             "open": lambda: self.active and self.active.open_entry(),
             "reveal": self.action_reveal,
+            "open_windows": self.action_open_windows,
             "vscode": self.action_vscode,
-            "edit": self.action_edit,
             "terminal": self.action_focus_terminal,
             "mark": lambda: self.active and self.active.toggle_mark(),
             "rename": self.action_rename,
@@ -2406,21 +2504,66 @@ class MainScreen(Screen):
         spawn(["code", str(target)], cwd=str(pane.path))
         self.app.notify(f"VS Code: {target.name or target}", timeout=2)
 
+    def action_open_windows(self) -> None:
+        if self.active:
+            self.active.open_in_windows()
+
     def action_edit(self) -> None:
-        pane = self.active
-        if pane is None or pane.current is None or pane.current.is_dir:
+        """e: im eingebetteten Editor öffnen – auch Dateien, die „Öffnen“ an Windows gäbe."""
+        e = self.active.current if self.active else None
+        if e is not None and not e.is_dir:
+            self.open_in_editor(e.path)
+
+    # ---------- Eingebetteter Editor (rechts) ----------
+    @property
+    def editor(self) -> EditorPanel:
+        return self.query_one(EditorPanel)
+
+    @property
+    def editor_busy(self) -> bool:
+        """True, solange im Editor eine Datei offen ist (ungespeicherte Änderungen möglich)."""
+        return self.editor.is_open and self.editor.view.running
+
+    def open_in_editor(self, path: Path) -> None:
+        editor = self.editor
+        if editor.is_open:
+            if editor.path != path:
+                self.app.notify(
+                    f"Im Editor ist noch „{editor.path.name if editor.path else '?'}“ offen – "
+                    "bitte zuerst speichern und schließen (Ctrl+X).",
+                    title="Editor belegt",
+                    severity="warning",
+                    markup=False,
+                )
+            editor.view.focus()
             return
-        editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or (
-            "nano" if shutil.which("nano") else "vi"
-        )
-        with self.app.suspend():
-            subprocess.call([*shlex.split(editor), str(pane.current.path)], cwd=str(pane.path))
-        pane.reload()
+        configured = self.cfg.get("editor") or "nano"
+        argv = editor_command(configured, path)
+        if argv is None:
+            self.app.notify(
+                f"Editor „{configured}“ nicht gefunden – z. B. mit 'sudo apt install nano' installieren.",
+                title="Kein Editor",
+                severity="error",
+                markup=False,
+            )
+            return
+        self.query_one("#main").add_class("-editing")
+        editor.open(path, argv)
+
+    def _editor_closed(self) -> None:
+        path = self.editor.path
+        self.editor.close()
+        self.query_one("#main").remove_class("-editing")
+        if self.active:
+            self.active.table.focus()
+        for pane in self.panes:
+            if path is not None and pane.path == path.parent:
+                pane.reload()
 
     # ---------- Eingebettetes Terminal ----------
     @property
     def term(self) -> TerminalView:
-        return self.query_one(TerminalView)
+        return self.query_one("#term-view", TerminalView)
 
     @property
     def term_panel(self) -> TerminalPanel:
@@ -2456,10 +2599,21 @@ class MainScreen(Screen):
         self._open_terminal()
 
     def action_switch_focus(self) -> None:
-        if self.term.has_focus and self.active:
-            self.active.table.focus()
+        """F12: Dateien → Editor (falls offen) → Terminal → Dateien."""
+        stops = ["files", *(["editor"] if self.editor.is_open else []), "terminal"]
+        if self.term.has_focus:
+            current = "terminal"
+        elif self.editor.view.has_focus:
+            current = "editor"
         else:
+            current = "files"
+        target = stops[(stops.index(current) + 1) % len(stops)]
+        if target == "editor":
+            self.editor.view.focus()
+        elif target == "terminal":
             self._open_terminal()
+        elif self.active:
+            self.active.table.focus()
 
     def action_terminal_size(self, bigger: bool) -> None:
         panel = self.term_panel
@@ -2470,11 +2624,11 @@ class MainScreen(Screen):
     _term_synced_cwd: str | None = None
 
     def on_descendant_focus(self, event: events.DescendantFocus) -> None:
-        if isinstance(event.widget, TerminalView):
+        if event.widget is self.term:
             self._sync_pane_to_terminal()
 
     def on_descendant_blur(self, event: events.DescendantBlur) -> None:
-        if isinstance(event.widget, TerminalView):
+        if event.widget is self.term:
             self._sync_terminal_to_pane()
 
     def _sync_pane_to_terminal(self) -> None:
@@ -2500,6 +2654,9 @@ class MainScreen(Screen):
         self._term_synced_cwd = cwd
 
     def on_terminal_view_exited(self, event: TerminalView.Exited) -> None:
+        if event.view is self.editor.view:
+            self._editor_closed()
+            return
         self.term_panel.remove_class("-on")
         self.update_topbar()
         if self.active:
@@ -2686,10 +2843,27 @@ class MainScreen(Screen):
         self._create("file")
 
     # ---------- Beenden ----------
+    def confirm_quit(self, quit_now: Callable[[], None]) -> None:
+        """Beendet – mit Rückfrage, solange im Editor eine Datei offen ist."""
+        if not self.editor_busy:
+            quit_now()
+            return
+        name = self.editor.path.name if self.editor.path else "eine Datei"
+
+        def done(ok: bool | None) -> None:
+            if ok:
+                quit_now()
+
+        message = f"Im Editor ist noch „{name}“ geöffnet.\nUngespeicherte Änderungen gehen beim Beenden verloren."
+        self.app.push_screen(ConfirmDialog(message, "Trotzdem beenden", default_yes=False), done)
+
     def action_quit_cd(self) -> None:
-        if self.active:
-            self.app.final_dir = str(self.active.path)  # type: ignore[attr-defined]
-        self.app.exit()
+        def quit_now() -> None:
+            if self.active:
+                self.app.final_dir = str(self.active.path)  # type: ignore[attr-defined]
+            self.app.exit()
+
+        self.confirm_quit(quit_now)
 
 
 # --------------------------------------------------------------------------- #
@@ -2711,6 +2885,7 @@ class WSLUI(App):
         padding: 0 1; scrollbar-size-vertical: 1;
     }
     #preview.-on { display: block; }
+    #main.-editing #preview { display: none; }  /* der Editor nimmt den Platz der Vorschau ein */
     .pane {
         width: 1fr; height: 1fr;
         border: round $panel-lighten-2;
@@ -2761,6 +2936,12 @@ class WSLUI(App):
             yield SystemCommand("Vorschau an/aus", "Vorschau-Spalte rechts", screen.action_toggle_preview)
             for k, (label, _) in LAYOUTS.items():
                 yield SystemCommand(f"Layout {k}: {label}", "Fensteraufteilung", lambda k=k: screen.action_layout(k))
+
+    async def action_quit(self) -> None:
+        if self.main_screen is not None and self.main_screen.is_attached:
+            self.main_screen.confirm_quit(self.exit)
+        else:
+            self.exit()
 
     def _toggle_click_copy(self) -> None:
         self.cfg["click_copy"] = not self.cfg["click_copy"]

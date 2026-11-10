@@ -3,8 +3,10 @@
 Ein moderner, mausfreundlicher Dateimanager mit eingebautem Terminal für die WSL.
 
 - **Klick** auf eine Datei kopiert ihren Namen in die Windows-Zwischenablage
-- **Doppelklick** öffnet Ordner (bzw. Dateien mit dem Windows-Standardprogramm)
-- **Rechtsklick** öffnet ein Kontextmenü (Pfad / Windows-Pfad kopieren, Explorer, VS Code, Umbenennen …)
+- **Doppelklick** öffnet Ordner – und Textdateien in **nano**, eingebettet rechts neben den Dateien
+  (Bilder, PDFs, Office-Dokumente … weiterhin mit dem Windows-Standardprogramm)
+- **Rechtsklick** öffnet ein Kontextmenü (Öffnen, In Windows öffnen, Pfad / Windows-Pfad kopieren,
+  Explorer, VS Code, Umbenennen …)
 - **8 Fenster-Layouts**: ½|½, ½|¼¼, 4×¼, ½/½, ⅓×3 … (Tasten `1`–`8` oder oben anklicken)
 - **Terminal unten** (`Ctrl+T`) für git & Co. – folgt automatisch dem aktuellen Ordner
 - **Sauberes Einfügen** mit `Ctrl+V` / Rechtsklick – ohne `~[[200~`-Sonderzeichen
@@ -65,9 +67,10 @@ Beenden mit `q` – die Shell steht danach im zuletzt geöffneten Ordner.
 |---|---|
 | `c` / `p` / `w` | Name / Linux-Pfad / Windows-Pfad kopieren |
 | `Leertaste`, `a` | markieren / alle markieren |
-| `Enter`, `←`/`Backspace` | öffnen / eine Ebene hoch |
+| `Enter`, `←`/`Backspace` | öffnen (Textdateien in nano rechts) / eine Ebene hoch |
+| `e` / `O` | im Editor rechts / in Windows öffnen – `Ctrl+X` schließt nano |
 | `1`–`8` | Layout wechseln |
-| `Ctrl+T`, `F12` | Terminal ein/aus, zwischen Dateien und Terminal wechseln |
+| `Ctrl+T`, `F12` | Terminal ein/aus, reihum zwischen Dateien, Editor und Terminal wechseln |
 | `/` | Filter |
 | `b` / `B` | Favoriten / aktuellen Ordner merken |
 | `g` | Pfad eingeben (auch `C:\Users\...`) |
@@ -82,4 +85,5 @@ Beenden mit `q` – die Shell steht danach im zuletzt geöffneten Ordner.
 - Icons sehen mit einer [Nerd Font](https://www.nerdfonts.com/) noch besser aus – mit `i` umschalten (Emoji / Nerd Font / Einfach).
 - Text im Terminal mit der Maus markieren – beim Loslassen ist er sofort 1:1 in der Zwischenablage
   (Hinweis unten rechts). Umbrochene lange Zeilen wie URLs bleiben dabei am Stück.
-- Einstellungen liegen in `~/.config/wslui/config.json`.
+- Einstellungen liegen in `~/.config/wslui/config.json` – dort lässt sich z. B. mit
+  `"editor": "micro"` ein anderer eingebetteter Editor wählen (Standard: `nano`).
