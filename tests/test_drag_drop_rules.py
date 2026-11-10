@@ -75,3 +75,10 @@ def test_drop_menu_lists_preferred_action_first_with_modifier_hints() -> None:
         ("cancel", "Abbrechen", "Esc"),
     ]
     assert [ident for ident, _, _ in wslui.drop_menu_items("move")][:2] == ["move", "copy"]
+
+
+def test_folder_cannot_be_dropped_into_itself_or_below() -> None:
+    assert wslui.drops_into_itself([Path("/a/sub")], Path("/a/sub")) is True
+    assert wslui.drops_into_itself([Path("/a/sub")], Path("/a/sub/deep/er")) is True
+    assert wslui.drops_into_itself([Path("/a/sub")], Path("/a/subway")) is False
+    assert wslui.drops_into_itself([Path("/a/x.txt")], Path("/b")) is False

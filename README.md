@@ -7,6 +7,8 @@ Ein moderner, mausfreundlicher Dateimanager mit eingebautem Terminal für die WS
   (Bilder, PDFs, Office-Dokumente … weiterhin mit dem Windows-Standardprogramm)
 - **Rechtsklick** öffnet ein Kontextmenü (Öffnen, In Windows öffnen, Pfad / Windows-Pfad kopieren,
   Explorer, VS Code, Umbenennen …)
+- **Drag & Drop** zwischen Fenstern: Datei(en) auf ein anderes Fenster oder einen Ordner ziehen,
+  loslassen, *Hierher verschieben* / *Hierher kopieren* wählen (mit `Strg` bzw. `Shift` ohne Nachfrage)
 - **8 Fenster-Layouts**: ½|½, ½|¼¼, 4×¼, ½/½, ⅓×3 … (Tasten `1`–`8` oder oben anklicken)
 - **Terminal unten** (`Ctrl+T`) für git & Co. – folgt automatisch dem aktuellen Ordner
 - **Sauberes Einfügen** mit `Ctrl+V` / Rechtsklick – ohne `~[[200~`-Sonderzeichen

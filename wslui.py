@@ -24,6 +24,8 @@ from textual import events, work
 from textual.app import App, ComposeResult, SystemCommand
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.errors import NoWidget
+from textual.geometry import Offset
 from textual.message import Message
 from textual.screen import ModalScreen, Screen
 from textual.widgets import (
@@ -547,6 +549,11 @@ def is_noop_drop(sources: Sequence[Path], target: Path) -> bool:
     return all(src.parent == target for src in sources)
 
 
+def drops_into_itself(sources: Sequence[Path], target: Path) -> bool:
+    """Ein Ordner kann nicht in sich selbst oder einen seiner Unterordner abgelegt werden."""
+    return any(target == src or src in target.parents for src in sources)
+
+
 def drop_action_from_modifiers(ctrl: bool, shift: bool) -> DropAction | None:
     """Wie im Windows-Explorer: Strg = kopieren, Shift = verschieben; ohne Taste → nachfragen."""
     if ctrl:
@@ -627,6 +634,48 @@ class FileTable(DataTable):
         super().__init__(cursor_type="row", zebra_stripes=False, show_cursor=True, **kw)
         self.pane = pane
         self._rendered_width = -1
+        self._press: tuple[int, int, int] | None = None  # (Zeile, x, y) beim Drücken der linken Taste
+
+    # ---------- Drag & Drop ----------
+    @property
+    def _drag(self) -> "DragController":
+        return self.screen.drag  # type: ignore[attr-defined]
+
+    def on_mouse_down(self, event: events.MouseDown) -> None:
+        if self._drag.active:  # Loslassen geschah außerhalb des Fensters → alten Vorgang verwerfen
+            self._drag.cancel()
+        self._press = None
+        row = event.style.meta.get("row")
+        if event.button == 1 and isinstance(row, int) and 0 <= row < self.row_count:
+            self._press = (row, event.screen_x, event.screen_y)
+            self.capture_mouse()
+
+    def on_mouse_move(self, event: events.MouseMove) -> None:
+        if self._press is None:
+            return
+        row, x0, y0 = self._press
+        if not self._drag.active:
+            # Erst ab spürbarer Bewegung ziehen – ein leicht verwackelter Klick bleibt ein Klick
+            if abs(event.screen_y - y0) < 1 and abs(event.screen_x - x0) < 2:
+                return
+            entries = self.pane.drag_entries(row)
+            if not entries:
+                self._press = None
+                self.release_mouse()
+                return
+            self.suppress_click()  # Ziehen ist kein Klick: nichts kopieren, nichts öffnen
+            self.move_cursor(row=row, animate=False)
+            self._drag.begin(self.pane, entries)
+        event.prevent_default()  # keine Hover-Markierung der DataTable während des Ziehens
+        self._drag.move(event.screen_x, event.screen_y)
+
+    def on_mouse_up(self, event: events.MouseUp) -> None:
+        if self._press is None:
+            return
+        self._press = None
+        self.release_mouse()
+        if self._drag.active:
+            self._drag.drop(event.screen_x, event.screen_y, ctrl=event.ctrl, shift=event.shift)
 
     async def _on_click(self, event: events.Click) -> None:
         event.prevent_default()  # Standardverhalten der DataTable unterdrücken
@@ -736,6 +785,19 @@ class Pane(Vertical):
             return sel
         cur = self.current
         return [cur] if cur and not cur.is_parent else []
+
+    def entry_at(self, row: int) -> Entry | None:
+        return self.view[row] if 0 <= row < len(self.view) else None
+
+    def drag_entries(self, row: int) -> list[Entry]:
+        """Was beim Ziehen ab `row` mitgeht: alle markierten Einträge, wenn die Zeile
+        markiert ist – sonst nur sie selbst ('..' nie)."""
+        e = self.entry_at(row)
+        if e is None or e.is_parent:
+            return []
+        if e.name in self.marked:
+            return [x for x in self.view if x.name in self.marked and not x.is_parent]
+        return [e]
 
     def on_click(self, event: events.Click) -> None:
         self.table.focus()
@@ -1833,6 +1895,128 @@ class EditorPanel(Vertical):
 
 
 # --------------------------------------------------------------------------- #
+# Drag & Drop (UI)
+# --------------------------------------------------------------------------- #
+
+
+class DragGhost(Static):
+    """Schwebendes Etikett am Mauszeiger, solange Dateien gezogen werden."""
+
+    DEFAULT_CSS = """
+    DragGhost {
+        display: none; overlay: screen; position: absolute;
+        width: auto; height: 1; padding: 0 1;
+        background: $accent; color: $text; text-style: bold;
+    }
+    DragGhost.-on { display: block; }
+    """
+
+    def show_at(self, x: int, y: int, label: Text) -> None:
+        self.update(label)
+        self.absolute_offset = Offset(x + 2, y)
+        self.add_class("-on")
+        self.refresh(layout=True)
+
+    def hide(self) -> None:
+        self.remove_class("-on")
+
+
+class DragController:
+    """Drag & Drop von Dateien zwischen (und innerhalb von) Dateifenstern.
+
+    Ablauf: begin → move … → drop (oder cancel). Beim Ablegen entscheidet Strg/Shift
+    direkt (kopieren/verschieben), sonst fragt ein kleines Menü nach – mit dem
+    Windows-Vorschlag (gleiches Laufwerk: verschieben, sonst kopieren) oben.
+    """
+
+    def __init__(self, screen: "MainScreen") -> None:
+        self._screen = screen
+        self._entries: list[Entry] = []
+        self._highlighted: Pane | None = None
+
+    @property
+    def active(self) -> bool:
+        return bool(self._entries)
+
+    @property
+    def _sources(self) -> list[Path]:
+        return [e.path for e in self._entries]
+
+    @property
+    def _ghost(self) -> DragGhost:
+        return self._screen.query_one(DragGhost)
+
+    def begin(self, source: Pane, entries: list[Entry]) -> None:
+        self._entries = list(entries)
+
+    def move(self, x: int, y: int) -> None:
+        target = self._target_at(x, y)
+        self._highlight(target[0] if target else None)
+        self._ghost.show_at(x, y, self._label(target[1] if target else None))
+
+    def drop(self, x: int, y: int, ctrl: bool = False, shift: bool = False) -> None:
+        target, sources = self._target_at(x, y), self._sources
+        self.cancel()
+        if target is None:
+            return
+        directory = target[1]
+        action = drop_action_from_modifiers(ctrl, shift)
+        if action is not None:
+            self._screen.transfer(action, sources, directory)
+            return
+
+        def chosen(result: str | None) -> None:
+            if result in ("copy", "move"):
+                self._screen.transfer(result, sources, directory)  # type: ignore[arg-type]
+
+        menu = ContextMenu(drop_menu_items(preferred_drop_action(sources, directory)), x, y)
+        self._screen.app.push_screen(menu, chosen)
+
+    def cancel(self) -> None:
+        self._entries = []
+        self._highlight(None)
+        self._ghost.hide()
+
+    def _target_at(self, x: int, y: int) -> tuple[Pane, Path] | None:
+        """Fenster und Zielordner unter dem Mauszeiger – None, wo Ablegen nichts bewirkt."""
+        try:
+            widget, _ = self._screen.get_widget_at(x, y)
+        except NoWidget:
+            return None
+        pane = next((n for n in widget.ancestors_with_self if isinstance(n, Pane)), None)
+        if pane is None:
+            return None
+        hovered = None
+        if isinstance(widget, FileTable):
+            row = self._screen.get_style_at(x, y).meta.get("row")
+            hovered = pane.entry_at(row) if isinstance(row, int) else None
+        directory = drop_dir(pane.path, hovered, self._sources)
+        if is_noop_drop(self._sources, directory) or drops_into_itself(self._sources, directory):
+            return None
+        return pane, directory
+
+    def _highlight(self, pane: Pane | None) -> None:
+        if pane is self._highlighted:
+            return
+        if self._highlighted is not None:
+            self._highlighted.remove_class("-droptarget")
+        if pane is not None:
+            pane.add_class("-droptarget")
+        self._highlighted = pane
+
+    def _label(self, directory: Path | None) -> Text:
+        mode = self._screen.cfg["icons"]
+        if len(self._entries) == 1:
+            e = self._entries[0]
+            label = Text(f"{icon_for(e.kind, mode)} {e.name}")
+        else:
+            label = Text(f"{icon_for('file', mode)} {len(self._entries)} Einträge")
+        if directory is not None:
+            label.append(f"  →  {icon_for('dir', mode)} {directory.name or directory}")
+        return label
+
+
+# --------------------------------------------------------------------------- #
 # Dialoge
 # --------------------------------------------------------------------------- #
 
@@ -2030,6 +2214,8 @@ HELP_MD = """\
 | **Klick** auf Datei/Ordner | auswählen **und Namen kopieren** |
 | **Doppelklick** | Ordner öffnen · Textdatei im Editor rechts (nano) · sonst Windows-Programm |
 | **Rechtsklick** | Kontextmenü (Öffnen, In Windows öffnen, Pfad, Explorer, Umbenennen …) |
+| **Ziehen** auf ein anderes Fenster / einen Ordner | verschieben oder kopieren – Menü beim Loslassen |
+| … mit `Strg` / `Shift` beim Loslassen | sofort kopieren / sofort verschieben |
 | Klick auf **Pfadleiste** | direkt in diesen Ordner springen |
 | Klick auf **Spaltenkopf** | sortieren (nochmal = umdrehen) |
 | Klick auf **Layout-Buttons** oben | Fensteraufteilung wechseln |
@@ -2212,6 +2398,7 @@ class MainScreen(Screen):
         self.layout_key = cfg.get("layout", "2") if cfg.get("layout") in LAYOUTS else "2"
         self.active: Pane | None = None
         self._pv_timer = None
+        self.drag = DragController(self)
 
     @property
     def cfg(self) -> dict:
@@ -2225,6 +2412,7 @@ class MainScreen(Screen):
             yield EditorPanel(id="editor")
         yield TerminalPanel(id="termpanel")
         yield Footer()
+        yield DragGhost()
 
     async def on_mount(self) -> None:
         if self.cfg.get("preview"):
@@ -2753,6 +2941,10 @@ class MainScreen(Screen):
         default = str(other.path) if other else str(pane.path)
         self.app.push_screen(InputDialog(f"{verb}: {what}  →  Zielordner", default), start)
 
+    def transfer(self, op: DropAction, sources: list[Path], target: Path) -> None:
+        """Kopiert/verschiebt `sources` nach `target` (im Hintergrund, mit Abschlussmeldung)."""
+        self._run_fileop(op, sources, target)
+
     @work(thread=True, group="fileop")
     def _run_fileop(self, op: str, sources: list[Path], target: Path) -> None:
         done = skipped = 0
@@ -2944,6 +3136,10 @@ class WSLUI(App):
     .pane.-active {
         border: round $primary;
         border-title-color: $primary; border-subtitle-color: $foreground;
+    }
+    .pane.-droptarget {
+        border: round $success;
+        border-title-color: $success; border-subtitle-color: $foreground;
     }
     .pathbar { height: 1; padding: 0 1; background: $boost; }
     FileTable { height: 1fr; background: transparent; scrollbar-size-vertical: 1; }
