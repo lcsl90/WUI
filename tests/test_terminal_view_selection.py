@@ -4,7 +4,7 @@ from __future__ import annotations
 from textual.app import App, ComposeResult
 
 import wslui
-from conftest import FakeClipboard
+from conftest import FakeClipboard, wait_until
 
 
 class TerminalHost(App):
@@ -112,3 +112,32 @@ async def test_text_with_markup_characters_is_shown_literally(clipboard: FakeCli
         note = list(app._notifications)[-1]
         assert note.message == "📋 [bold]x[/bold]"
         assert note.markup is False
+
+
+async def test_new_output_clears_highlight_because_the_text_moves(clipboard: FakeClipboard) -> None:
+    app = TerminalHost(clipboard)
+    async with app.run_test(size=(40, 6)) as pilot:
+        view = await started(pilot, b"hello\r\n")
+        await drag(pilot, view, (0, 0), (2, 0))
+        assert view.selection is not None
+
+        view.feed(b"more output\r\n")
+
+        await wait_until(pilot, lambda: view.selection is None)
+        assert clipboard.copied == ["hel"]
+
+
+async def test_output_while_dragging_keeps_the_selection(clipboard: FakeClipboard) -> None:
+    app = TerminalHost(clipboard)
+    async with app.run_test(size=(40, 6)) as pilot:
+        view = await started(pilot, b"hello\r\n")
+        await pilot.mouse_down(view, offset=(0, 0))
+        await pilot.hover(view, offset=(3, 0))
+
+        view.feed(b"tick\r\n")
+        await pilot.pause(0.15)  # mehrere Ticks
+
+        assert view.selection == wslui.TextSelection((0, 0), (3, 0))
+        await pilot.mouse_up(view, offset=(3, 0))
+        await pilot.pause()
+        assert clipboard.copied == ["hell"]

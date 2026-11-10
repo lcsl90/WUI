@@ -13,10 +13,11 @@ import stat
 import subprocess
 import sys
 import threading
+from collections.abc import Callable, Collection, Iterable, Sequence
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Collection, Iterable, Literal, Protocol, Sequence, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
 
 from rich.syntax import Syntax
 from rich.text import Text
@@ -565,12 +566,16 @@ def drop_action_from_modifiers(ctrl: bool, shift: bool) -> DropAction | None:
 
 
 def preferred_drop_action(
-    sources: Sequence[Path], target: Path, device: Callable[[Path], int] = lambda p: os.lstat(p).st_dev
+    sources: Sequence[Path], target: Path, device: Callable[[Path], int] = lambda p: os.stat(p).st_dev
 ) -> DropAction:
-    """Vorschlag wie im Windows-Explorer: gleiches Laufwerk → verschieben, sonst kopieren."""
+    """Vorschlag wie im Windows-Explorer: gleiches Laufwerk → verschieben, sonst kopieren.
+
+    Verglichen werden die Ordner (Symlinks aufgelöst), in denen die Quellen liegen,
+    mit dem Zielordner – dort entscheidet sich, ob ein schnelles Umbenennen möglich ist.
+    """
     try:
         target_dev = device(target)
-        same_drive = all(device(src) == target_dev for src in sources)
+        same_drive = all(device(src.parent) == target_dev for src in sources)
     except OSError:
         return "copy"
     return "move" if same_drive else "copy"
@@ -666,7 +671,7 @@ class FileTable(DataTable):
                 return
             self.suppress_click()  # Ziehen ist kein Klick: nichts kopieren, nichts öffnen
             self.move_cursor(row=row, animate=False)
-            self._drag.begin(self.pane, entries)
+            self._drag.begin(entries)
         event.prevent_default()  # keine Hover-Markierung der DataTable während des Ziehens
         self._drag.move(event.screen_x, event.screen_y)
 
@@ -1478,6 +1483,8 @@ class TerminalView(Widget, can_focus=True):
         self.command: list[str] | None = None  # None = interaktive Shell
         self.selection: TextSelection | None = None
         self._sel_anchor: Cell | None = None
+        self._output_seq = 0  # zählt Ausgaben – verschiebt sich der Text, passt die Markierung nicht mehr
+        self._sel_seq = 0
 
     # ---------- Prozess ----------
     @property
@@ -1499,6 +1506,7 @@ class TerminalView(Widget, can_focus=True):
         with self.lock:
             if self.stream is not None:
                 self.stream.feed(data)
+            self._output_seq += 1
         self._dirty = True
 
     def start(self) -> None:
@@ -1609,6 +1617,8 @@ class TerminalView(Widget, can_focus=True):
     def _tick(self) -> None:
         if self._dirty:
             self._dirty = False
+            if self.selection is not None and self._sel_anchor is None and self._output_seq != self._sel_seq:
+                self.selection = None  # Text hat sich bewegt – Markierung wäre irreführend
             self.refresh()
 
     def on_resize(self, event: events.Resize) -> None:
@@ -1765,6 +1775,7 @@ class TerminalView(Widget, can_focus=True):
             return
         self._sel_anchor = None
         self.release_mouse()
+        self._sel_seq = self._output_seq
         if self.selection is not None:
             self._copy_selection(self.selection)
 
@@ -1947,7 +1958,7 @@ class DragController:
     def _ghost(self) -> DragGhost:
         return self._screen.query_one(DragGhost)
 
-    def begin(self, source: Pane, entries: list[Entry]) -> None:
+    def begin(self, entries: list[Entry]) -> None:
         self._entries = list(entries)
 
     def move(self, x: int, y: int) -> None:

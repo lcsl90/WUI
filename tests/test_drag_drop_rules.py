@@ -54,7 +54,8 @@ def test_modifiers_decide_like_windows_explorer() -> None:
 
 
 def test_preferred_action_is_move_on_same_drive_and_copy_across_drives() -> None:
-    devices = {Path("/home/u/a.txt"): 1, Path("/home/u/b"): 1, Path("/mnt/c/x"): 2}
+    # verglichen wird der Ordner der Quelle mit dem Zielordner (Symlinks aufgelöst)
+    devices = {Path("/home/u"): 1, Path("/home/u/b"): 1, Path("/mnt/c/x"): 2}
     device = devices.__getitem__
     assert wslui.preferred_drop_action([Path("/home/u/a.txt")], Path("/home/u/b"), device=device) == "move"
     assert wslui.preferred_drop_action([Path("/home/u/a.txt")], Path("/mnt/c/x"), device=device) == "copy"
@@ -82,3 +83,12 @@ def test_folder_cannot_be_dropped_into_itself_or_below() -> None:
     assert wslui.drops_into_itself([Path("/a/sub")], Path("/a/sub/deep/er")) is True
     assert wslui.drops_into_itself([Path("/a/sub")], Path("/a/subway")) is False
     assert wslui.drops_into_itself([Path("/a/x.txt")], Path("/b")) is False
+
+
+def test_preferred_action_with_real_paths_and_symlinked_target_on_one_drive_is_move(tmp_path: Path) -> None:
+    real = tmp_path / "real"
+    real.mkdir()
+    (tmp_path / "link").symlink_to(real)
+    src = tmp_path / "a.txt"
+    src.write_text("a", encoding="utf-8")
+    assert wslui.preferred_drop_action([src], tmp_path / "link") == "move"
