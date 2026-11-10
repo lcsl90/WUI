@@ -27,6 +27,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.errors import NoWidget
 from textual.geometry import Offset
 from textual.message import Message
+from textual.notifications import SeverityLevel
 from textual.screen import ModalScreen, Screen
 from textual.widgets import (
     Button,
@@ -1053,7 +1054,7 @@ class Pane(Vertical):
         if e.broken:
             self.app.notify("Defekter Symlink", severity="warning")
         elif open_external(e.path):
-            self.app.notify(f"Öffne {e.name} …", timeout=2, markup=False)
+            self.app.notify(f"Öffne {e.name} …", timeout=2)
         else:
             self.app.notify("Kein Programm zum Öffnen gefunden", severity="error")
 
@@ -2770,7 +2771,6 @@ class MainScreen(Screen):
                     "bitte zuerst speichern und schließen (Ctrl+X).",
                     title="Editor belegt",
                     severity="warning",
-                    markup=False,
                 )
             editor.view.focus()
             return
@@ -2781,7 +2781,6 @@ class MainScreen(Screen):
                 f"Editor „{configured}“ nicht gefunden – z. B. mit 'sudo apt install nano' installieren.",
                 title="Kein Editor",
                 severity="error",
-                markup=False,
             )
             return
         self.query_one("#main").add_class("-editing")
@@ -3181,6 +3180,18 @@ class WSLUI(App):
             yield SystemCommand("Vorschau an/aus", "Vorschau-Spalte rechts", screen.action_toggle_preview)
             for k, (label, _) in LAYOUTS.items():
                 yield SystemCommand(f"Layout {k}: {label}", "Fensteraufteilung", lambda k=k: screen.action_layout(k))
+
+    def notify(
+        self,
+        message: str,
+        *,
+        title: str = "",
+        severity: SeverityLevel = "information",
+        timeout: float | None = None,
+        markup: bool = False,
+    ) -> None:
+        """Wie App.notify – aber ohne Markup: Datei- und Pfadnamen wie 'log[1].txt' bleiben wörtlich."""
+        super().notify(message, title=title, severity=severity, timeout=timeout, markup=markup)
 
     async def action_quit(self) -> None:
         if self.main_screen is not None and self.main_screen.is_attached:

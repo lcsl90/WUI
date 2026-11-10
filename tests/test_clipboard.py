@@ -31,3 +31,19 @@ async def test_click_on_file_copies_its_name(tmp_path: Path, clipboard: FakeClip
         await pilot.click(pane.table, offset=(4, 2))  # Kopfzeile, "..", hello.txt
 
         await wait_until(pilot, lambda: clipboard.copied == ["hello.txt"])
+
+
+async def test_names_with_brackets_are_shown_literally_in_toast(tmp_path: Path, clipboard: FakeClipboard) -> None:
+    (tmp_path / "log[bold].txt").write_text("x", encoding="utf-8")
+    app = wslui.WSLUI(tmp_path, clipboard=clipboard)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        pane = app.screen.panes[0]
+        await wait_for_listing(pilot, pane, ["..", "log[bold].txt"])
+
+        await pilot.click(pane.table, offset=(4, 2))
+
+        await wait_until(pilot, lambda: clipboard.copied == ["log[bold].txt"])
+        note = list(app._notifications)[-1]
+        assert note.message == "📋 log[bold].txt"
+        assert note.markup is False
