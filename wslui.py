@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Literal, Protocol, runtime_checkable
 
 from rich.syntax import Syntax
+from rich.table import Table
 from rich.text import Text
 from textual import events, work
 from textual.app import App, ComposeResult, SystemCommand
@@ -64,6 +65,8 @@ DEFAULT_CONFIG = {
     "editor": "nano",  # Editor für „Öffnen“ – läuft eingebettet rechts neben den Dateien
     "panes": [],
     "bookmarks": [],
+    "dock_height": None,  # Höhe des unteren Bereichs (Terminal/Container) in Zeilen; None = 40 %
+    "containers": [],  # geöffnete Container-Übersichten: "docker" und/oder "podman"
 }
 
 
@@ -592,6 +595,168 @@ def drop_menu_items(preferred: DropAction) -> list[tuple[str, str, str]]:
 # --------------------------------------------------------------------------- #
 # Kleine Widgets
 # --------------------------------------------------------------------------- #
+
+
+# --------------------------------------------------------------------------- #
+# Container-Übersicht: Docker / Podman (reine Logik – ohne UI testbar)
+# --------------------------------------------------------------------------- #
+
+CONTAINER_ENGINES = {"docker": "Docker", "podman": "Podman"}  # Reihenfolge = Priorität
+# Docker liefert mit dieser Vorlage eine JSON-Zeile je Container, Podman mit "json" ein JSON-Array.
+_CONTAINER_PS_FORMAT = {"docker": "{{json .}}", "podman": "json"}
+_EXIT_CODE_RE = re.compile(r"\((\d+)\)")
+_HEALTH_ORDER = {"error": 0, "warn": 1, "ok": 2, "off": 3}
+_HEALTH_LOOK = {"error": ("✖", "bold red"), "warn": ("◐", "yellow"), "ok": ("●", "green"), "off": ("○", "dim")}
+
+
+@dataclass(frozen=True)
+class Container:
+    name: str
+    image: str
+    state: str  # running, exited, restarting, paused, created, dead …
+    status: str  # z. B. "Up 3 hours (healthy)" oder "Exited (1) 5 minutes ago"
+    ports: str
+    exit_code: int | None = None
+
+    @property
+    def health(self) -> str:
+        """error = braucht Aufmerksamkeit · warn = Übergangszustand · ok = läuft · off = sauber beendet."""
+        status = self.status.lower()
+        if self.state in ("dead", "restarting") or "unhealthy" in status:
+            return "error"
+        if self.state in ("exited", "stopped"):
+            return "error" if self.exit_code else "off"
+        if self.state == "running":
+            return "warn" if "starting" in status else "ok"
+        return "warn"  # paused, created, removing, configured …
+
+
+def available_engines() -> list[str]:
+    """Installierte Container-Programme; ist keines da, trotzdem Docker (zeigt dann den Hinweis)."""
+    return [e for e in CONTAINER_ENGINES if shutil.which(e)] or ["docker"]
+
+
+def _format_ports(raw: object) -> str:
+    if isinstance(raw, str):  # Docker: "0.0.0.0:8080->80/tcp, [::]:8080->80/tcp"
+        parts = [re.sub(r"^(0\.0\.0\.0|\[::\]|::):", "", p.strip()) for p in raw.split(",") if p.strip()]
+    else:  # Podman: Liste von {"host_port": 8080, "container_port": 80, "protocol": "tcp"}
+        parts = []
+        for p in raw or []:  # type: ignore[union-attr]
+            if isinstance(p, dict):
+                host, cont = p.get("host_port"), p.get("container_port")
+                target = f"{cont}/{p.get('protocol') or 'tcp'}"
+                parts.append(f"{host}->{target}" if host else target)
+    return ", ".join(dict.fromkeys(parts))
+
+
+def parse_containers(output: str) -> list[Container]:
+    """Liest die Ausgabe von `docker ps -a --format '{{json .}}'` bzw. `podman ps -a --format json`.
+
+    Sortiert: Probleme zuerst, dann laufende, dann beendete Container.
+    """
+    text = output.strip()
+    if not text:
+        return []
+    rows = json.loads(text) if text.startswith("[") else [json.loads(ln) for ln in text.splitlines() if ln.strip()]
+    containers = []
+    for row in rows:
+        names = row.get("Names") or row.get("Name") or row.get("ID") or row.get("Id") or "?"
+        state = str(row.get("State") or "").lower()
+        status = str(row.get("Status") or state)
+        code = row.get("ExitCode")
+        if not isinstance(code, int):
+            match = _EXIT_CODE_RE.search(status) if state != "running" else None
+            code = int(match.group(1)) if match else None
+        containers.append(
+            Container(
+                name=", ".join(names) if isinstance(names, list) else str(names),
+                image=str(row.get("Image") or ""),
+                state=state,
+                status=status,
+                ports=_format_ports(row.get("Ports")),
+                exit_code=code,
+            )
+        )
+    return sorted(containers, key=lambda c: (_HEALTH_ORDER[c.health], natkey(c.name)))
+
+
+def run_container_ps(engine: str) -> tuple[list[Container], str | None]:
+    """Fragt die Container ab: (Liste, None) oder ([], Fehlermeldung). Blockiert – im Thread aufrufen."""
+    label = CONTAINER_ENGINES.get(engine, engine)
+    if not shutil.which(engine):
+        return [], f"{label} ist nicht installiert ('{engine}' nicht gefunden)."
+    cmd = [engine, "ps", "-a", "--format", _CONTAINER_PS_FORMAT.get(engine, "{{json .}}")]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return [], f"{label} antwortet nicht (Zeitüberschreitung)."
+    except OSError as exc:
+        return [], f"{label} lässt sich nicht starten: {exc}"
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip()
+        return [], detail or f"'{' '.join(cmd)}' endete mit Code {proc.returncode}."
+    try:
+        return parse_containers(proc.stdout), None
+    except (ValueError, AttributeError) as exc:
+        return [], f"Unerwartete Ausgabe von {label}: {exc}"
+
+
+def container_summary(containers: Sequence[Container]) -> str:
+    """Kurzfassung für die Titelzeile, z. B. "3 laufen · 1 Fehler · 2 beendet"."""
+    count = {h: sum(1 for c in containers if c.health == h) for h in _HEALTH_ORDER}
+    parts = [f"{count['ok']} laufen"]
+    if count["error"]:
+        parts.append(f"{count['error']} Fehler")
+    if count["warn"]:
+        parts.append(f"{count['warn']} im Übergang")
+    if count["off"]:
+        parts.append(f"{count['off']} beendet")
+    return " · ".join(parts)
+
+
+_CONTAINER_COLUMNS = ("name", "status", "image", "ports")
+# Bei Platzmangel wird in dieser Reihenfolge gekürzt – jeweils bis zur Mindestbreite (0 = Spalte entfällt).
+_CONTAINER_SHRINK = (("ports", 0), ("image", 0), ("status", 12), ("name", 8))
+_CONTAINER_MAX_WIDTH = {"name": 32, "status": 32, "image": 44, "ports": 44}
+_CONTAINER_GAP = 2
+
+
+def container_column_widths(containers: Sequence[Container], width: int) -> dict[str, int]:
+    """Spaltenbreiten für `width` Zeichen: Name und Status haben Vorrang vor Image und Ports."""
+    widths = {
+        col: min(max([len(col), *(len(getattr(c, col)) for c in containers)]), _CONTAINER_MAX_WIDTH[col])
+        for col in _CONTAINER_COLUMNS
+    }
+
+    def total() -> int:
+        return 1 + sum(w + _CONTAINER_GAP for w in widths.values() if w)
+
+    for col, floor in _CONTAINER_SHRINK:
+        if total() <= width:
+            break
+        widths[col] = max(min(floor, widths[col]), widths[col] - (total() - width))
+        if widths[col] < 4:  # weniger als "abc…" lohnt nicht – dann lieber ganz weglassen
+            widths[col] = 0
+    return widths
+
+
+def container_table(containers: Sequence[Container], width: int = 120) -> Table:
+    widths = container_column_widths(containers, width)
+    shown = [col for col in _CONTAINER_COLUMNS if widths[col]]
+    table = Table(box=None, padding=(0, _CONTAINER_GAP, 0, 0), pad_edge=False, header_style="dim")
+    table.add_column("", no_wrap=True, width=1)
+    for col in shown:
+        table.add_column(col.upper(), no_wrap=True, overflow="ellipsis", width=widths[col])
+    for c in containers:
+        mark, style = _HEALTH_LOOK[c.health]
+        cells = {
+            "name": Text(c.name, style="bold" if c.health != "off" else ""),
+            "status": Text(c.status, style=style),
+            "image": Text(c.image),
+            "ports": Text(c.ports),
+        }
+        table.add_row(Text(mark, style=style), *(cells[col] for col in shown), style="dim" if c.health == "off" else "")
+    return table
 
 
 class ClickBar(Static):
@@ -1416,6 +1581,12 @@ class WrapTrackingScreen(pyte.HistoryScreen if pyte is not None else object):  #
         self._mark(self.buffer[self.cursor.y], self._in_draw)
         super().linefeed()
 
+    def index(self) -> None:
+        if _ALT_SCREEN_MODES.isdisjoint(self.mode):
+            super().index()
+        else:  # Vollbildprogramme (nano, less …) schreiben nichts in den Verlauf der Shell
+            pyte.Screen.index(self)
+
     def erase_in_line(self, how: int = 0, private: bool = False) -> None:
         super().erase_in_line(how, private)
         if how in (0, 2):
@@ -1426,6 +1597,41 @@ class WrapTrackingScreen(pyte.HistoryScreen if pyte is not None else object):  #
         rows = {0: range(self.cursor.y + 1, self.lines), 1: range(self.cursor.y)}.get(how, range(self.lines))
         for y in rows:
             self._mark(self.buffer[y], False)
+
+
+    def scroll_up(self, count: int = 1, *rest: int, private: bool = False) -> None:
+        """CSI S: Inhalt des Scrollbereichs um `count` Zeilen nach oben schieben (pyte kennt das nicht).
+
+        nano, less, vim & Co. blättern damit – ohne diese Sequenz blieben beim Scrollen die alten
+        Zeilen stehen und nur die neu gezeichneten am Rand änderten sich.
+        """
+        if not (rest or private):  # „CSI ? … S“ u. Ä. sind andere (Grafik-)Abfragen
+            self._scroll_region(count, up=True)
+
+    def scroll_down(self, count: int = 1, *rest: int, private: bool = False) -> None:
+        """CSI T: Inhalt des Scrollbereichs um `count` Zeilen nach unten schieben."""
+        if not (rest or private):  # mit mehreren Parametern ist es Maus-Tracking, kein Scrollen
+            self._scroll_region(count, up=False)
+
+    def _scroll_region(self, count: int, up: bool) -> None:
+        top, bottom = self.margins or (0, self.lines - 1)
+        x, y = self.cursor.x, self.cursor.y
+        for _ in range(min(max(count, 1), bottom - top + 1)):
+            if up:
+                self.cursor.y = bottom
+                self.index()
+            else:
+                self.cursor.y = top
+                self.reverse_index()
+        self.cursor.x, self.cursor.y = x, y
+
+
+class TerminalStream(pyte.ByteStream if pyte is not None else object):  # type: ignore[misc]
+    """pyte-ByteStream, der zusätzlich die Scroll-Sequenzen CSI S / CSI T weiterreicht."""
+
+    if pyte is not None:
+        csi = {**pyte.ByteStream.csi, "S": "scroll_up", "T": "scroll_down"}
+        events = pyte.ByteStream.events | {"scroll_up", "scroll_down"}
 
 
 def _pyte_color(c: str) -> str | None:
@@ -1498,7 +1704,7 @@ class TerminalView(Widget, can_focus=True):
         screen.write_process_input = self._write_str  # Antworten auf Terminal-Abfragen
         with self.lock:
             self.pscreen = screen
-            self.stream = pyte.ByteStream(screen)
+            self.stream = TerminalStream(screen)
         self._set_selection(None)
 
     def feed(self, data: bytes) -> None:
@@ -1841,12 +2047,11 @@ class TerminalView(Widget, can_focus=True):
 class TerminalPanel(Vertical):
     DEFAULT_CSS = """
     TerminalPanel {
-        display: none; height: 40%; min-height: 6;
+        display: none; width: 1fr; height: 1fr;
         border: round $panel-lighten-2; border-title-color: $text-muted;
         border-subtitle-color: $text-muted; border-subtitle-align: right;
     }
     TerminalPanel.-on { display: block; }
-    TerminalPanel.-big { height: 75%; }
     TerminalPanel:focus-within { border: round $success; border-title-color: $success; }
     """
 
@@ -1855,7 +2060,159 @@ class TerminalPanel(Vertical):
 
     def on_mount(self) -> None:
         self.border_title = Text(" >_ Terminal ", style="bold")
-        self.border_subtitle = Text(" Ctrl+T ein/aus · F12 Fenster wechseln · Ctrl+↑ größer ")
+        self.border_subtitle = Text(" Ctrl+T ein/aus · F12 wechseln · oberen Rand ziehen = Höhe ")
+
+
+class ContainerPanel(Vertical):
+    """Live-Übersicht der Container von Docker bzw. Podman – wie `docker ps -a`, laufend aktualisiert."""
+
+    DEFAULT_CSS = """
+    ContainerPanel {
+        display: none; width: 1fr; height: 1fr;
+        border: round $panel-lighten-2; border-title-color: $text-muted;
+        border-subtitle-color: $text-muted; border-subtitle-align: right;
+    }
+    ContainerPanel.-on { display: block; }
+    ContainerPanel.-problem { border: round $error; border-title-color: $error; }
+    ContainerPanel > VerticalScroll { padding: 0 1; scrollbar-size-vertical: 1; }
+    ContainerPanel Static { width: auto; }
+    """
+    REFRESH_SECONDS = 2.0
+
+    def __init__(self, engine: str, **kw) -> None:
+        super().__init__(**kw)
+        self.engine = engine
+        self.label = CONTAINER_ENGINES.get(engine, engine)
+        self.containers: list[Container] = []
+        self.error: str | None = None
+        self._busy = False
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(can_focus=False):
+            yield Static(Text("Lade …", style="dim"))
+
+    def on_mount(self) -> None:
+        self.border_title = Text(f" ▦ {self.label} ", style="bold")
+        self.set_interval(self.REFRESH_SECONDS, self.poll)
+
+    @property
+    def is_open(self) -> bool:
+        return self.has_class("-on")
+
+    def set_open(self, on: bool) -> None:
+        self.set_class(on, "-on")
+        if on:
+            self.poll()
+
+    def poll(self) -> None:
+        if self.is_open and not self._busy:
+            self._busy = True
+            self._fetch()
+
+    @work(thread=True, group="containers")
+    def _fetch(self) -> None:
+        try:
+            containers, error = run_container_ps(self.engine)
+        except Exception as exc:  # noqa: BLE001  (die Übersicht darf die App nie mitreißen)
+            containers, error = [], str(exc)
+        try:
+            self.app.call_from_thread(self.show, containers, error)
+        except Exception:  # noqa: BLE001  (App bereits beendet)
+            pass
+
+    def on_resize(self, event: events.Resize) -> None:
+        if self.containers:
+            self.query_one(Static).update(container_table(self.containers, self._table_width()))
+
+    def _table_width(self) -> int:
+        return max(self.query_one(VerticalScroll).size.width - 2, 20)  # abzüglich Innenabstand
+
+    def show(self, containers: list[Container], error: str | None) -> None:
+        self._busy = False
+        self.containers, self.error = containers, error
+        body = self.query_one(Static)
+        stamp = datetime.now().strftime("%H:%M:%S")
+        if error is not None:
+            body.update(Text(error, style="red"))
+            self.border_subtitle = Text(f" nicht erreichbar · {stamp} ")
+        elif not containers:
+            body.update(Text("Keine Container vorhanden.", style="dim"))
+            self.border_subtitle = Text(f" 0 Container · live {stamp} ")
+        else:
+            body.update(container_table(containers, self._table_width()))
+            self.border_subtitle = Text(f" {container_summary(containers)} · live {stamp} ")
+        self.set_class(error is None and any(c.health == "error" for c in containers), "-problem")
+
+
+class Dock(Horizontal):
+    """Unterer Bereich für Terminal und Container-Übersichten.
+
+    Die Höhe lässt sich mit der Maus am oberen Rand ziehen (bleibt gespeichert).
+    """
+
+    DEFAULT_CSS = """
+    Dock { display: none; height: 40%; min-height: 6; max-height: 85%; }
+    Dock.-on { display: block; }
+    Dock.-big { height: 75%; }
+    Dock.-grip > *, Dock.-grip > ContainerPanel.-problem { border-top: heavy $warning; }
+    """
+    MIN_ROWS = 6
+
+    def __init__(self, **kw) -> None:
+        super().__init__(**kw)
+        self._resizing = False
+
+    def on_mount(self) -> None:
+        self.set_rows(self.app.cfg.get("dock_height"))  # type: ignore[attr-defined]
+
+    def sync_visibility(self) -> None:
+        self.set_class(any(child.has_class("-on") for child in self.children), "-on")
+
+    def clamp_rows(self, rows: int) -> int:
+        return max(self.MIN_ROWS, min(rows, self.screen.size.height - 6))
+
+    def set_rows(self, rows: object) -> None:
+        """Feste Höhe in Zeilen; alles andere (None) = Standardhöhe aus dem CSS."""
+        if isinstance(rows, int) and not isinstance(rows, bool) and rows > 0:
+            self.styles.height = self.clamp_rows(rows)
+        else:
+            self.styles.clear_rule("height")
+
+    def set_big(self, big: bool) -> None:
+        """Ctrl+↑ / Ctrl+↓: groß bzw. zurück zur selbst eingestellten Höhe."""
+        self.set_class(big, "-big")
+        self.set_rows(None if big else self.app.cfg.get("dock_height"))  # type: ignore[attr-defined]
+
+    def _on_grip(self, event: events.MouseEvent) -> bool:
+        return event.screen_y == self.region.y
+
+    def on_mouse_down(self, event: events.MouseDown) -> None:
+        if event.button == 1 and self._on_grip(event):
+            event.stop()
+            self._resizing = True
+            self.remove_class("-big")
+            self.add_class("-grip")
+            self.capture_mouse()
+
+    def on_mouse_move(self, event: events.MouseMove) -> None:
+        if self._resizing:
+            event.stop()
+            self.set_rows(max(self.region.bottom - event.screen_y, 1))  # set_rows begrenzt auf den erlaubten Bereich
+        else:
+            self.set_class(self._on_grip(event), "-grip")
+
+    def on_mouse_up(self, event: events.MouseUp) -> None:
+        if not self._resizing:
+            return
+        event.stop()
+        self._resizing = False
+        self.release_mouse()
+        self.set_class(self._on_grip(event), "-grip")
+        self.app.cfg["dock_height"] = self.clamp_rows(self.region.height)  # type: ignore[attr-defined]
+
+    def on_leave(self, event: events.Leave) -> None:
+        if not self._resizing:
+            self.remove_class("-grip")
 
 
 class EditorPanel(Vertical):
@@ -2275,6 +2632,7 @@ direkt mit dem Windows-Programm. Anderer Editor: `"editor"` in `~/.config/wslui/
 | `Ctrl+T` | Terminal unten ein-/ausblenden (läuft im Hintergrund weiter) |
 | `t` / `F12` | ins Terminal springen / zwischen Dateien und Terminal wechseln |
 | `Ctrl+↑` / `Ctrl+↓` | Terminal groß / normal |
+| **oberen Rand ziehen** | Höhe mit der Maus frei einstellen (wird gemerkt) |
 | **Maus ziehen** | markieren – beim Loslassen sofort kopiert (Hinweis unten rechts) |
 | `Ctrl+V`, `Shift+Einfg`, **Rechtsklick** | Einfügen – bereinigt, ohne `~[[200~`-Müll, ohne Auto-Enter |
 | Mausrad | im Verlauf zurückscrollen |
@@ -2283,6 +2641,16 @@ direkt mit dem Windows-Programm. Anderer Editor: `"editor"` in `~/.config/wslui/
 Das Terminal wechselt automatisch in den Ordner des aktiven Fensters – und umgekehrt
 folgt das Fenster, wenn du im Terminal mit `cd` woanders hin gehst.
 Markierter Text wird 1:1 kopiert – umbrochene lange Zeilen (z. B. URLs) bleiben am Stück.
+
+## Container (Docker / Podman)
+| Taste | Wirkung |
+|---|---|
+| `d` / Klick auf **▦ Docker** oben | Live-Übersicht ein/aus – wie `docker ps -a`, alle 2 s aktualisiert |
+| `D` / Klick auf **▦ Podman** oben | dasselbe für Podman |
+
+Zeigt Name, Status samt Laufzeit, Image und Ports. `●` läuft · `◐` Übergang (startet, pausiert) ·
+`✖` Fehler (abgestürzt, unhealthy, Neustart-Schleife – steht oben, Rahmen wird rot) · `○` sauber beendet.
+Die Übersicht liegt unten neben dem Terminal und bleibt beim nächsten Start geöffnet.
 
 ## Kopieren in die Zwischenablage
 | Taste | Kopiert |
@@ -2370,6 +2738,8 @@ class MainScreen(Screen):
         Binding("ctrl+up", "terminal_size(True)", show=False, priority=True),
         Binding("ctrl+down", "terminal_size(False)", show=False, priority=True),
         Binding("t", "focus_terminal", show=False),
+        Binding("d", "toggle_containers('')", show=False),
+        Binding("D", "toggle_containers('podman')", show=False),
         Binding("T", "terminal", show=False),
         Binding("P", "toggle_preview", show=False),
         Binding("o", "reveal", show=False),
@@ -2411,6 +2781,7 @@ class MainScreen(Screen):
         self.active: Pane | None = None
         self._pv_timer = None
         self.drag = DragController(self)
+        self.engines = available_engines()
 
     @property
     def cfg(self) -> dict:
@@ -2422,7 +2793,10 @@ class MainScreen(Screen):
             yield Vertical(id="root")
             yield Preview(id="preview")
             yield EditorPanel(id="editor")
-        yield TerminalPanel(id="termpanel")
+        with Dock(id="dock"):
+            yield TerminalPanel(id="termpanel")
+            for engine in CONTAINER_ENGINES:
+                yield ContainerPanel(engine, id=f"containers-{engine}")
         yield Footer()
         yield DragGhost()
 
@@ -2431,6 +2805,9 @@ class MainScreen(Screen):
             self.query_one("#preview").add_class("-on")
         await self.set_layout(self.layout_key, initial=True)
         self.set_interval(2.0, self._poll)
+        for engine in self.cfg.get("containers") or []:
+            if engine in self.engines:
+                self.set_containers(engine, True)
 
     def on_resize(self) -> None:
         self.update_topbar()
@@ -2513,12 +2890,35 @@ class MainScreen(Screen):
 
     def _click_terminal(self) -> None:
         if self._term_on():
-            self.term_panel.remove_class("-on")
-            self.update_topbar()
-            if self.active:
-                self.active.table.focus()
+            self._hide_terminal()
         else:
             self._open_terminal()
+
+    def _hide_terminal(self) -> None:
+        self.term_panel.remove_class("-on")
+        self.dock.sync_visibility()
+        self.update_topbar()
+        if self.active:
+            self.active.table.focus()
+
+    # ---------- Container-Übersicht (Docker / Podman) ----------
+    @property
+    def dock(self) -> Dock:
+        return self.query_one(Dock)
+
+    def container_panel(self, engine: str) -> ContainerPanel:
+        return self.query_one(f"#containers-{engine}", ContainerPanel)
+
+    def set_containers(self, engine: str, on: bool) -> None:
+        self.container_panel(engine).set_open(on)
+        self.dock.sync_visibility()
+        self.cfg["containers"] = [e for e in CONTAINER_ENGINES if self.container_panel(e).is_open]
+        self.update_topbar()
+
+    def action_toggle_containers(self, engine: str = "") -> None:
+        """d: Docker (bzw. das installierte Programm) · D: Podman."""
+        engine = engine or self.engines[0]
+        self.set_containers(engine, not self.container_panel(engine).is_open)
 
     def update_topbar(self) -> None:
         bar = self.query_one("#topbar", ClickBar)
@@ -2551,9 +2951,21 @@ class MainScreen(Screen):
             ),
             (Text(" ? Hilfe ", style="bold"), self.action_help),
         ]
+        for engine in reversed(self.engines):
+            on = self.container_panel(engine).is_open
+            right.insert(
+                3,
+                (
+                    Text(f" ▦ {CONTAINER_ENGINES[engine]} ", style="bold reverse" if on else "bold"),
+                    (lambda engine=engine: self.action_toggle_containers(engine)),
+                ),
+            )
         left_w = sum(t.cell_len for t, _ in items)
+        width = bar.size.width or 120
+        while len(right) > 1 and left_w + sum(t.cell_len for t, _ in right) + len(right) - 1 >= width:
+            right.pop(0)  # schmales Fenster: von links her weglassen, statt alles zu verstecken
         right_w = sum(t.cell_len for t, _ in right) + len(right) - 1
-        gap = (bar.size.width or 120) - left_w - right_w
+        gap = width - left_w - right_w
         if gap > 0:
             items.append((Text(" " * gap), None))
             for i, it in enumerate(right):
@@ -2820,6 +3232,7 @@ class MainScreen(Screen):
         panel, tv = self.term_panel, self.term
         if not panel.has_class("-on"):
             panel.add_class("-on")
+            self.dock.sync_visibility()
             self.update_topbar()
         if not tv.running:
             if self.active:
@@ -2835,10 +3248,7 @@ class MainScreen(Screen):
         if not panel.has_class("-on"):
             self._open_terminal()
         elif tv.has_focus:
-            panel.remove_class("-on")
-            self.update_topbar()
-            if self.active:
-                self.active.table.focus()
+            self._hide_terminal()
         else:
             tv.focus()
 
@@ -2863,9 +3273,8 @@ class MainScreen(Screen):
             self.active.table.focus()
 
     def action_terminal_size(self, bigger: bool) -> None:
-        panel = self.term_panel
-        if panel.has_class("-on"):
-            panel.set_class(bigger, "-big")
+        if self.dock.has_class("-on"):
+            self.dock.set_big(bigger)
 
     _term_synced_pane: str | None = None
     _term_synced_cwd: str | None = None
@@ -2904,10 +3313,7 @@ class MainScreen(Screen):
         if event.view is self.editor.view:
             self._editor_closed()
             return
-        self.term_panel.remove_class("-on")
-        self.update_topbar()
-        if self.active:
-            self.active.table.focus()
+        self._hide_terminal()
         self.app.notify("Shell beendet – Ctrl+T startet eine neue", timeout=2)
 
     def action_terminal(self) -> None:
@@ -3189,6 +3595,12 @@ class WSLUI(App):
             yield SystemCommand("Klick kopiert Namen an/aus", "Einfacher Klick kopiert den Dateinamen", self._toggle_click_copy)
             yield SystemCommand("Versteckte Dateien an/aus", "Dotfiles anzeigen", screen.action_toggle_hidden)
             yield SystemCommand("Vorschau an/aus", "Vorschau-Spalte rechts", screen.action_toggle_preview)
+            for engine in screen.engines:
+                yield SystemCommand(
+                    f"{CONTAINER_ENGINES[engine]}-Container an/aus",
+                    "Live-Übersicht der Container (läuft / Laufzeit / Fehler)",
+                    lambda engine=engine: screen.action_toggle_containers(engine),
+                )
             for k, (label, _) in LAYOUTS.items():
                 yield SystemCommand(f"Layout {k}: {label}", "Fensteraufteilung", lambda k=k: screen.action_layout(k))
 

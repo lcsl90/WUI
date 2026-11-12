@@ -12,7 +12,10 @@ Ein moderner, mausfreundlicher Dateimanager mit eingebautem Terminal für die WS
   geht es ohne Nachfrage – sofern das Terminal die Taste weitergibt (Windows Terminal nutzt
   Shift+Maus selbst für seine Textauswahl)
 - **8 Fenster-Layouts**: ½|½, ½|¼¼, 4×¼, ½/½, ⅓×3 … (Tasten `1`–`8` oder oben anklicken)
-- **Terminal unten** (`Ctrl+T`) für git & Co. – folgt automatisch dem aktuellen Ordner
+- **Terminal unten** (`Ctrl+T`) für git & Co. – folgt automatisch dem aktuellen Ordner;
+  die Höhe lässt sich mit der Maus am oberen Rand ziehen (wird gemerkt)
+- **Docker / Podman live** (`d` / `D` oder oben anklicken): wie `docker ps -a`, alle 2 s aktualisiert –
+  Name, Status samt Laufzeit, Image, Ports; abgestürzte oder „unhealthy“ Container stehen rot oben
 - **Sauberes Einfügen** mit `Ctrl+V` / Rechtsklick – ohne `~[[200~`-Sonderzeichen
 - **Markieren = Kopieren** im Terminal: Maus ziehen, loslassen – fertig
 - Farbige Dateitypen + Icons, Vorschau mit Syntax-Highlighting, Favoriten & Laufwerke
@@ -75,6 +78,8 @@ Beenden mit `q` – die Shell steht danach im zuletzt geöffneten Ordner.
 | `e` / `O` | im Editor rechts / in Windows öffnen – `Ctrl+X` schließt nano |
 | `1`–`8` | Layout wechseln |
 | `Ctrl+T`, `F12` | Terminal ein/aus, reihum zwischen Dateien, Editor und Terminal wechseln |
+| `Ctrl+↑` / `Ctrl+↓` | Terminal groß / zurück zur eingestellten Höhe |
+| `d` / `D` | Container-Übersicht für Docker / Podman ein/aus (neben dem Terminal) |
 | `/` | Filter |
 | `b` / `B` | Favoriten / aktuellen Ordner merken |
 | `g` | Pfad eingeben (auch `C:\Users\...`) |
@@ -104,3 +109,5 @@ Fake-Zwischenablage; der nano-Test wird übersprungen, wenn nano nicht installie
   (Hinweis unten rechts). Umbrochene lange Zeilen wie URLs bleiben dabei am Stück.
 - Einstellungen liegen in `~/.config/wslui/config.json` – dort lässt sich z. B. mit
   `"editor": "micro"` ein anderer eingebetteter Editor wählen (Standard: `nano`).
+- Die Container-Übersicht zeigt oben nur Knöpfe für installierte Programme (`docker`, `podman`).
+  Ist der Dienst nicht erreichbar, steht die Fehlermeldung des Programms im Fenster.
